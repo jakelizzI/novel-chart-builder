@@ -16,16 +16,18 @@ export interface FlowNode {
   y: number;
   /** 四角（節）ノード専用: ENDフラグ */
   isEnd?: boolean;
-  /** ひし形（分岐）ノード専用: 分岐先の個数 */
+  /** 分岐先の個数（四角の場合はデフォルト1、ひし形の場合はデフォルト2） */
   branchCount?: number;
 }
 
 export interface FlowEdge {
   id: string;
   sourceId: string;
-  /** 四角の場合は常に 0、ひし形の場合は 0 〜 (branchCount - 1) */
+  /** 0 〜 (branchCount - 1) */
   sourceSlot: number;
   targetId: string;
+  /** 分岐の線に表示するコメント（例：「SAN値が80以下の場合」） */
+  label?: string;
 }
 
 export interface FlowchartData {

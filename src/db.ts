@@ -35,7 +35,7 @@ db.exec(`
     x REAL NOT NULL,
     y REAL NOT NULL,
     is_end INTEGER NOT NULL DEFAULT 0,
-    branch_count INTEGER NOT NULL DEFAULT 2,
+    branch_count INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (project_id, id),
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
   );
@@ -46,10 +46,17 @@ db.exec(`
     source_id TEXT NOT NULL,
     source_slot INTEGER NOT NULL,
     target_id TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (project_id, id),
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
   );
 `);
+
+// Safe migration for existing databases created before `edges.label` existed
+const edgeCols = db.query("PRAGMA table_info(edges)").all() as Array<{ name: string }>;
+if (!edgeCols.some((c) => c.name === "label")) {
+  db.exec("ALTER TABLE edges ADD COLUMN label TEXT NOT NULL DEFAULT '';");
+}
 
 export function listProjects(): ProjectSummary[] {
   const rows = db
@@ -113,12 +120,12 @@ export function getFlowchart(projectId: string): FlowchartData | null {
     x: r.x,
     y: r.y,
     ...(r.type === "rect" ? { isEnd: Boolean(r.is_end) } : {}),
-    ...(r.type === "diamond" ? { branchCount: r.branch_count } : {}),
+    branchCount: r.branch_count ?? (r.type === "diamond" ? 2 : 1),
   }));
 
   const edges = db
     .query(
-      "SELECT id, source_id as sourceId, source_slot as sourceSlot, target_id as targetId FROM edges WHERE project_id = ?"
+      "SELECT id, source_id as sourceId, source_slot as sourceSlot, target_id as targetId, label FROM edges WHERE project_id = ?"
     )
     .all(projectId) as FlowEdge[];
 
@@ -164,15 +171,22 @@ const saveTx = db.transaction((data: FlowchartData, now: string) => {
       node.x,
       node.y,
       node.type === "rect" && node.isEnd ? 1 : 0,
-      node.type === "diamond" ? (node.branchCount ?? 2) : 1
+      node.branchCount ?? (node.type === "diamond" ? 2 : 1)
     );
   }
 
   const insertEdge = db.query(
-    "INSERT INTO edges (id, project_id, source_id, source_slot, target_id) VALUES (?, ?, ?, ?, ?)"
+    "INSERT INTO edges (id, project_id, source_id, source_slot, target_id, label) VALUES (?, ?, ?, ?, ?, ?)"
   );
   for (const edge of data.edges) {
-    insertEdge.run(edge.id, data.id, edge.sourceId, edge.sourceSlot, edge.targetId);
+    insertEdge.run(
+      edge.id,
+      data.id,
+      edge.sourceId,
+      edge.sourceSlot,
+      edge.targetId,
+      edge.label ?? ""
+    );
   }
 });
 

@@ -1,6 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createInitialFlowchart, createMinimalFlowchart } from "./defaultData";
-import type { ChapterLane, FlowchartData, FlowEdge, FlowNode, NodeType, ProjectSummary } from "./types";
+import type {
+  ChapterLane,
+  FlowchartData,
+  FlowEdge,
+  FlowNode,
+  NodeType,
+  ProjectSummary,
+} from "./types";
 
 const RECT_WIDTH = 210;
 const RECT_HEIGHT = 76;
@@ -9,6 +16,9 @@ const DIAMOND_HEIGHT = 112;
 const PLUS_OFFSET_Y = 38;
 const PLUS_RADIUS = 13;
 const CHAPTER_HEADER_WIDTH = 240;
+const MIN_ZOOM = 0.3;
+const MAX_ZOOM = 2.0;
+const ZOOM_STEP = 0.1;
 const LOCAL_STORAGE_KEY = "novel-chart-builder:current";
 
 interface ActivePlusMenu {
@@ -27,6 +37,18 @@ function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+function clampZoom(z: number): number {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(z * 100) / 100));
+}
+
+function getNodeSlotCount(node: FlowNode): number {
+  if (node.type === "rect") {
+    if (node.isEnd) return 0;
+    return Math.max(1, node.branchCount ?? 1);
+  }
+  return Math.max(1, node.branchCount ?? 2);
+}
+
 function getNodeTopPoint(node: FlowNode): { x: number; y: number } {
   const halfH = node.type === "rect" ? RECT_HEIGHT / 2 : DIAMOND_HEIGHT / 2;
   return { x: node.x, y: node.y - halfH };
@@ -39,10 +61,10 @@ function getNodeBottomPoint(node: FlowNode): { x: number; y: number } {
 
 function getSlotPlusPosition(node: FlowNode, slot: number): { x: number; y: number } {
   const bottom = getNodeBottomPoint(node);
-  if (node.type === "rect") {
+  const count = getNodeSlotCount(node);
+  if (count <= 1) {
     return { x: bottom.x, y: bottom.y + PLUS_OFFSET_Y };
   }
-  const count = Math.max(1, node.branchCount ?? 2);
   const spacing = count <= 3 ? 64 : count <= 5 ? 50 : 40;
   const offsetX = (slot - (count - 1) / 2) * spacing;
   return { x: bottom.x + offsetX, y: bottom.y + PLUS_OFFSET_Y };
@@ -69,6 +91,7 @@ export function App() {
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [plusMenu, setPlusMenu] = useState<ActivePlusMenu | null>(null);
   const [mergeMode, setMergeMode] = useState<MergeModeState | null>(null);
+  const [zoom, setZoom] = useState<number>(1.0);
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "offline">("saved");
 
   // Dragging node state
@@ -91,6 +114,7 @@ export function App() {
   } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const canvasScrollRef = useRef<HTMLDivElement | null>(null);
   const initialLoadDone = useRef(false);
 
   // Load initial project from SQLite server on startup
@@ -153,16 +177,34 @@ export function App() {
     return () => clearTimeout(timer);
   }, [chart]);
 
-  // Close Escape for merge mode / popover
+  // Close Escape for merge mode / popover / edge editor
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === "Escape") {
         setMergeMode(null);
         setPlusMenu(null);
+        setSelectedEdgeId(null);
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  // Ctrl + Scroll Wheel to zoom in/out on the canvas
+  useEffect(() => {
+    const container = canvasScrollRef.current;
+    if (!container) return;
+
+    function handleWheel(e: WheelEvent) {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP;
+        setZoom((prev) => clampZoom(prev + delta));
+      }
+    }
+
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => container.removeEventListener("wheel", handleWheel);
   }, []);
 
   // Compute cumulative Y ranges for each chapter lane
@@ -205,6 +247,11 @@ export function App() {
     [selectedNodeId, nodeMap]
   );
 
+  const selectedEdge = useMemo(
+    () => (selectedEdgeId ? chart.edges.find((e) => e.id === selectedEdgeId) ?? null : null),
+    [selectedEdgeId, chart.edges]
+  );
+
   // Determine which chapter lane a given Y coordinate falls into
   function getChapterForY(y: number) {
     for (const ch of chapterRanges) {
@@ -215,14 +262,14 @@ export function App() {
     return chapterRanges[chapterRanges.length - 1] ?? null;
   }
 
-  // Handle mouse move / up for node dragging & chapter resizing
+  // Handle mouse move / up for node dragging & chapter resizing (accounting for zoom)
   useEffect(() => {
     if (!draggingNode && !resizingChapter) return;
 
     function onMouseMove(e: MouseEvent) {
       if (draggingNode) {
-        const dx = e.clientX - draggingNode.startX;
-        const dy = e.clientY - draggingNode.startY;
+        const dx = (e.clientX - draggingNode.startX) / zoom;
+        const dy = (e.clientY - draggingNode.startY) / zoom;
         const moved = draggingNode.hasMoved || Math.abs(dx) > 3 || Math.abs(dy) > 3;
         if (moved && !draggingNode.hasMoved) {
           setDraggingNode((prev) => (prev ? { ...prev, hasMoved: true } : null));
@@ -231,7 +278,6 @@ export function App() {
         const nextY = Math.max(55, Math.round(draggingNode.origY + dy));
 
         setChart((prev) => {
-          // Also expand bottom chapter if node is dragged below all chapters
           const totalH = prev.chapters.reduce((sum, c) => sum + c.height, 0);
           let updatedChapters = prev.chapters;
           if (nextY + 120 > totalH && prev.chapters.length > 0) {
@@ -251,7 +297,7 @@ export function App() {
       }
 
       if (resizingChapter) {
-        const dy = e.clientY - resizingChapter.startY;
+        const dy = (e.clientY - resizingChapter.startY) / zoom;
         const newHeight = Math.max(160, Math.round(resizingChapter.origHeight + dy));
         const actualDiff = newHeight - resizingChapter.origHeight;
 
@@ -288,11 +334,11 @@ export function App() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [draggingNode, resizingChapter]);
+  }, [draggingNode, resizingChapter, zoom]);
 
-  // Check if a diamond node has any unconnected branch slots
-  function getDiamondBranchState(node: FlowNode) {
-    const branchCount = Math.max(1, node.branchCount ?? 2);
+  // Check branch connection state of a node (used for diamond red state & rect multi-branch status)
+  function getNodeBranchState(node: FlowNode) {
+    const branchCount = getNodeSlotCount(node);
     const connectedSlots = new Set<number>();
     for (const edge of chart.edges) {
       if (
@@ -314,17 +360,265 @@ export function App() {
     };
   }
 
+  // Automatic hierarchical layout (自動ソート・整列)
+  function handleAutoSort() {
+    setChart((prev) => {
+      if (prev.nodes.length === 0) return prev;
+
+      const validIds = new Set(prev.nodes.map((n) => n.id));
+      const validEdges = prev.edges.filter(
+        (e) => validIds.has(e.sourceId) && validIds.has(e.targetId) && e.sourceId !== e.targetId
+      );
+
+      const inDegree = new Map<string, number>();
+      const outEdges = new Map<string, FlowEdge[]>();
+      const inEdges = new Map<string, FlowEdge[]>();
+
+      for (const n of prev.nodes) {
+        inDegree.set(n.id, 0);
+        outEdges.set(n.id, []);
+        inEdges.set(n.id, []);
+      }
+
+      for (const e of validEdges) {
+        inDegree.set(e.targetId, (inDegree.get(e.targetId) ?? 0) + 1);
+        outEdges.get(e.sourceId)?.push(e);
+        inEdges.get(e.targetId)?.push(e);
+      }
+
+      for (const list of outEdges.values()) {
+        list.sort((a, b) => a.sourceSlot - b.sourceSlot);
+      }
+
+      // Find roots (inDegree === 0), fallback to topmost node if cycle
+      let roots = prev.nodes
+        .filter((n) => (inDegree.get(n.id) ?? 0) === 0)
+        .sort((a, b) => a.y - b.y || a.x - b.x);
+
+      if (roots.length === 0) {
+        const sortedByY = [...prev.nodes].sort((a, b) => a.y - b.y || a.x - b.x);
+        roots = [sortedByY[0]!];
+      }
+
+      // Assign hierarchical layer (depth) via BFS / longest path without cycles
+      const layerMap = new Map<string, number>();
+      const queue: Array<{ id: string; depth: number; path: Set<string> }> = [];
+
+      for (const r of roots) {
+        layerMap.set(r.id, 0);
+        queue.push({ id: r.id, depth: 0, path: new Set([r.id]) });
+      }
+
+      while (queue.length > 0) {
+        const curr = queue.shift()!;
+        const edgesFromCurr = outEdges.get(curr.id) ?? [];
+        for (const edge of edgesFromCurr) {
+          if (curr.path.has(edge.targetId)) continue; // avoid cycle infinite loop
+          const nextDepth = curr.depth + 1;
+          const prevDepth = layerMap.get(edge.targetId) ?? -1;
+          if (nextDepth > prevDepth) {
+            layerMap.set(edge.targetId, nextDepth);
+            const nextPath = new Set(curr.path);
+            nextPath.add(edge.targetId);
+            queue.push({ id: edge.targetId, depth: nextDepth, path: nextPath });
+          }
+        }
+      }
+
+      // Any disconnected cycle components not reached yet
+      for (const n of prev.nodes) {
+        if (!layerMap.has(n.id)) {
+          layerMap.set(n.id, 0);
+        }
+      }
+
+      // Group nodes by layer
+      const maxLayer = Math.max(0, ...Array.from(layerMap.values()));
+      const layers: FlowNode[][] = Array.from({ length: maxLayer + 1 }, () => []);
+      for (const n of prev.nodes) {
+        const l = layerMap.get(n.id) ?? 0;
+        layers[l]!.push(n);
+      }
+
+      // Order nodes within each layer to minimize edge crossings & respect sourceSlot order
+      const nodeOrderInLayer = new Map<string, number>();
+      layers[0]!.sort((a, b) => a.x - b.x);
+      layers[0]!.forEach((n, idx) => nodeOrderInLayer.set(n.id, idx));
+
+      for (let l = 1; l <= maxLayer; l++) {
+        const layerNodes = layers[l]!;
+        layerNodes.sort((a, b) => {
+          const aParents = (inEdges.get(a.id) ?? []).filter(
+            (e) => (layerMap.get(e.sourceId) ?? 0) < l
+          );
+          const bParents = (inEdges.get(b.id) ?? []).filter(
+            (e) => (layerMap.get(e.sourceId) ?? 0) < l
+          );
+
+          const aScore =
+            aParents.length > 0
+              ? aParents.reduce(
+                  (sum, e) =>
+                    sum + (nodeOrderInLayer.get(e.sourceId) ?? 0) * 100 + e.sourceSlot,
+                  0
+                ) / aParents.length
+              : a.x;
+          const bScore =
+            bParents.length > 0
+              ? bParents.reduce(
+                  (sum, e) =>
+                    sum + (nodeOrderInLayer.get(e.sourceId) ?? 0) * 100 + e.sourceSlot,
+                  0
+                ) / bParents.length
+              : b.x;
+
+          return aScore - bScore || a.x - b.x;
+        });
+        layerNodes.forEach((n, idx) => nodeOrderInLayer.set(n.id, idx));
+      }
+
+      // Compute primary tree children for subtree width calculation
+      const primaryChildren = new Map<string, string[]>();
+      for (const n of prev.nodes) {
+        primaryChildren.set(n.id, []);
+      }
+      for (let l = 1; l <= maxLayer; l++) {
+        for (const n of layers[l]!) {
+          const parents = (inEdges.get(n.id) ?? [])
+            .filter((e) => (layerMap.get(e.sourceId) ?? 0) < l)
+            .sort(
+              (a, b) =>
+                (layerMap.get(b.sourceId) ?? 0) - (layerMap.get(a.sourceId) ?? 0) ||
+                a.sourceSlot - b.sourceSlot
+            );
+          if (parents[0]) {
+            primaryChildren.get(parents[0].sourceId)?.push(n.id);
+          }
+        }
+      }
+
+      const H_GAP = 255;
+      const V_START = 95;
+      const V_GAP = 190;
+
+      const subtreeWidth = new Map<string, number>();
+      function calcWidth(id: string): number {
+        const ch = primaryChildren.get(id) ?? [];
+        if (ch.length === 0) {
+          subtreeWidth.set(id, H_GAP);
+          return H_GAP;
+        }
+        const sum = ch.reduce((acc, cid) => acc + calcWidth(cid), 0);
+        const w = Math.max(H_GAP, sum);
+        subtreeWidth.set(id, w);
+        return w;
+      }
+
+      for (const r of layers[0]!) {
+        calcWidth(r.id);
+      }
+      for (const n of prev.nodes) {
+        if (!subtreeWidth.has(n.id)) {
+          calcWidth(n.id);
+        }
+      }
+
+      const newX = new Map<string, number>();
+      function placeSubtree(id: string, centerX: number) {
+        newX.set(id, centerX);
+        const ch = primaryChildren.get(id) ?? [];
+        if (ch.length === 0) return;
+        const totalW = ch.reduce((acc, cid) => acc + (subtreeWidth.get(cid) ?? H_GAP), 0);
+        let cursor = centerX - totalW / 2;
+        for (const cid of ch) {
+          const w = subtreeWidth.get(cid) ?? H_GAP;
+          placeSubtree(cid, cursor + w / 2);
+          cursor += w;
+        }
+      }
+
+      // Place roots horizontally
+      const totalRootsWidth = layers[0]!.reduce(
+        (acc, r) => acc + (subtreeWidth.get(r.id) ?? H_GAP),
+        0
+      );
+      const baseCenterX = Math.max(
+        CHAPTER_HEADER_WIDTH + 160 + totalRootsWidth / 2,
+        640
+      );
+      let rootCursor = baseCenterX - totalRootsWidth / 2;
+      for (const r of layers[0]!) {
+        const w = subtreeWidth.get(r.id) ?? H_GAP;
+        placeSubtree(r.id, rootCursor + w / 2);
+        rootCursor += w;
+      }
+
+      // Resolve any remaining nodes or horizontal overlaps per layer
+      for (let l = 0; l <= maxLayer; l++) {
+        const layerNodes = layers[l]!;
+        for (let i = 0; i < layerNodes.length; i++) {
+          const n = layerNodes[i]!;
+          if (!newX.has(n.id)) {
+            newX.set(n.id, baseCenterX + (i - (layerNodes.length - 1) / 2) * H_GAP);
+          }
+        }
+        // Ensure minimum X and non-overlapping spacing
+        for (let i = 0; i < layerNodes.length; i++) {
+          const n = layerNodes[i]!;
+          let xVal = newX.get(n.id) ?? baseCenterX;
+          if (i === 0) {
+            xVal = Math.max(CHAPTER_HEADER_WIDTH + 145, xVal);
+          } else {
+            const prevNode = layerNodes[i - 1]!;
+            const prevX = newX.get(prevNode.id) ?? CHAPTER_HEADER_WIDTH + 145;
+            xVal = Math.max(xVal, prevX + H_GAP);
+          }
+          newX.set(n.id, Math.round(xVal));
+        }
+      }
+
+      // If leftmost node was pushed right, shift entire chart so minimum X is comfortable
+      const minPlacedX = Math.min(...Array.from(newX.values()));
+      const minAllowedX = CHAPTER_HEADER_WIDTH + 150;
+      const shiftX = minPlacedX < minAllowedX ? minAllowedX - minPlacedX : 0;
+
+      const updatedNodes = prev.nodes.map((n) => {
+        const l = layerMap.get(n.id) ?? 0;
+        return {
+          ...n,
+          x: Math.round((newX.get(n.id) ?? n.x) + shiftX),
+          y: Math.round(V_START + l * V_GAP),
+        };
+      });
+
+      const maxRequiredY = V_START + maxLayer * V_GAP + 150;
+      const currentChaptersH = prev.chapters.reduce((sum, c) => sum + c.height, 0);
+      let updatedChapters = prev.chapters;
+      if (maxRequiredY > currentChaptersH && prev.chapters.length > 0) {
+        const extra = maxRequiredY - currentChaptersH;
+        updatedChapters = prev.chapters.map((c, idx) =>
+          idx === prev.chapters.length - 1 ? { ...c, height: c.height + extra } : c
+        );
+      }
+
+      return {
+        ...prev,
+        chapters: updatedChapters,
+        nodes: updatedNodes,
+      };
+    });
+  }
+
   // Create a new child node (rect or diamond) from a source node's slot
   function handleCreateChildNode(sourceId: string, sourceSlot: number, targetType: NodeType) {
     const sourceNode = nodeMap.get(sourceId);
     if (!sourceNode) return;
 
-    const count = sourceNode.type === "diamond" ? Math.max(1, sourceNode.branchCount ?? 2) : 1;
+    const count = getNodeSlotCount(sourceNode);
     const horizontalSpread = count > 1 ? (sourceSlot - (count - 1) / 2) * 250 : 0;
     let targetX = Math.max(CHAPTER_HEADER_WIDTH + 135, Math.round(sourceNode.x + horizontalSpread));
     const targetY = Math.round(sourceNode.y + 185);
 
-    // Avoid exact overlap with existing nodes at the same Y band
     while (
       chart.nodes.some(
         (n) => Math.abs(n.x - targetX) < 190 && Math.abs(n.y - targetY) < 90
@@ -347,6 +641,7 @@ export function App() {
             x: targetX,
             y: targetY,
             isEnd: false,
+            branchCount: 1,
           }
         : {
             id: newNodeId,
@@ -359,12 +654,11 @@ export function App() {
           };
 
     setChart((prev) => {
-      // Check if there was already an edge from (sourceId, sourceSlot)
       const existingEdge = prev.edges.find(
         (e) => e.sourceId === sourceId && e.sourceSlot === sourceSlot
       );
 
-      let nextEdges = prev.edges.filter(
+      const nextEdges = prev.edges.filter(
         (e) => !(e.sourceId === sourceId && e.sourceSlot === sourceSlot)
       );
 
@@ -373,19 +667,19 @@ export function App() {
         sourceId,
         sourceSlot,
         targetId: newNodeId,
+        label: existingEdge?.label ?? "",
       });
 
-      // If replacing an existing edge, connect the new node's slot 0 to the previous target (insert in between)
       if (existingEdge && nodeMap.has(existingEdge.targetId)) {
         nextEdges.push({
           id: uid("edge"),
           sourceId: newNodeId,
           sourceSlot: 0,
           targetId: existingEdge.targetId,
+          label: "",
         });
       }
 
-      // Expand last chapter lane height if new node goes beyond total chapter height
       const totalH = prev.chapters.reduce((sum, c) => sum + c.height, 0);
       let nextChapters = prev.chapters;
       if (targetY + 140 > totalH && prev.chapters.length > 0) {
@@ -412,6 +706,9 @@ export function App() {
   function handleConnectToExistingNode(sourceId: string, sourceSlot: number, targetId: string) {
     if (sourceId === targetId) return;
     setChart((prev) => {
+      const existing = prev.edges.find(
+        (e) => e.sourceId === sourceId && e.sourceSlot === sourceSlot
+      );
       const filtered = prev.edges.filter(
         (e) => !(e.sourceId === sourceId && e.sourceSlot === sourceSlot)
       );
@@ -424,12 +721,21 @@ export function App() {
             sourceId,
             sourceSlot,
             targetId,
+            label: existing?.label ?? "",
           },
         ],
       };
     });
     setMergeMode(null);
     setPlusMenu(null);
+  }
+
+  // Update edge label (分岐線のコメント)
+  function handleUpdateEdgeLabel(edgeId: string, label: string) {
+    setChart((prev) => ({
+      ...prev,
+      edges: prev.edges.map((e) => (e.id === edgeId ? { ...e, label } : e)),
+    }));
   }
 
   // Disconnect an edge from a specific slot
@@ -449,12 +755,10 @@ export function App() {
       const nextNodes = prev.nodes.map((n) => (n.id === nodeId ? { ...n, ...patch } : n));
       let nextEdges = prev.edges;
 
-      // If rect isEnd is set to true, remove outgoing edges from this rect
       if (patch.isEnd === true) {
         nextEdges = nextEdges.filter((e) => e.sourceId !== nodeId);
       }
 
-      // If diamond branchCount is reduced, trim edges whose sourceSlot >= new branchCount
       if (typeof patch.branchCount === "number") {
         const validCount = Math.max(1, patch.branchCount);
         nextEdges = nextEdges.filter(
@@ -596,6 +900,7 @@ export function App() {
       x: 540,
       y: 110,
       isEnd: false,
+      branchCount: 1,
     };
     setChart((prev) => ({
       ...prev,
@@ -654,6 +959,14 @@ export function App() {
 
           <button
             type="button"
+            className="btn btn-primary"
+            onClick={handleAutoSort}
+            title="ツリー構造に合わせて図形の位置を上から下へ自動整列します"
+          >
+            ⇄ 自動ソート（整列）
+          </button>
+          <button
+            type="button"
             className="btn btn-secondary"
             onClick={() => handleAddChapter()}
           >
@@ -709,559 +1022,690 @@ export function App() {
 
       {/* Main Workspace: Scrollable Canvas + Right Drawer */}
       <div className="workspace-body">
-        <div
-          className="canvas-scroll-container"
-          onClick={() => {
-            setPlusMenu(null);
-            setSelectedEdgeId(null);
-          }}
-        >
+        <div className="canvas-viewport-wrapper">
           <div
-            className="flowchart-canvas"
-            style={{
-              width: `${totalCanvasWidth}px`,
-              height: `${totalCanvasHeight}px`,
+            ref={canvasScrollRef}
+            className="canvas-scroll-container"
+            onClick={() => {
+              setPlusMenu(null);
+              setSelectedEdgeId(null);
             }}
           >
-            {/* 1. Horizontal Chapter Lanes Layer */}
-            {chapterRanges.map((ch) => (
-              <div
-                key={ch.id}
-                className={`chapter-lane ${ch.index % 2 === 1 ? "chapter-lane-alt" : ""}`}
-                style={{
-                  top: `${ch.top}px`,
-                  height: `${ch.height}px`,
-                }}
-              >
-                {/* Left Sticky Header inside each Chapter Lane */}
-                <div
-                  className="chapter-lane-sidebar"
-                  style={{ width: `${CHAPTER_HEADER_WIDTH}px` }}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <div className="chapter-badge-row">
-                    <span className="chapter-number-badge">CHAPTER {ch.index + 1}</span>
-                    <div className="chapter-mini-actions">
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        title="この章の下に新しい章を追加"
-                        onClick={() => handleAddChapter(ch.index)}
-                      >
-                        ＋
-                      </button>
-                      {chart.chapters.length > 1 && (
-                        <button
-                          type="button"
-                          className="icon-btn icon-btn-danger"
-                          title="この章エリアを削除"
-                          onClick={() => handleDeleteChapter(ch.id)}
-                        >
-                          ×
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  <input
-                    type="text"
-                    className="chapter-title-input"
-                    value={ch.title}
-                    onChange={(e) => handleUpdateChapterTitle(ch.id, e.target.value)}
-                    placeholder="章タイトルを入力..."
-                  />
-                  <div className="chapter-height-info">高さ: {Math.round(ch.height)}px</div>
-                </div>
-
-                {/* Horizontal Divider Line + Drag Resize Handle at bottom of chapter */}
-                <div
-                  className="chapter-divider-line"
-                  onMouseDown={(e) => {
-                    e.stopPropagation();
-                    setResizingChapter({
-                      chapterId: ch.id,
-                      startY: e.clientY,
-                      origHeight: ch.height,
-                      chapterBottomYAtStart: ch.bottom,
-                      shiftNodesBelow: !e.altKey,
-                    });
-                  }}
-                  title="上下にドラッグして章エリアの高さを変更（Altキーを押しながらで下部ノード位置を固定）"
-                >
-                  <span className="chapter-resize-pill">⇕ 章の境界線（ドラッグで高さ調整）</span>
-                </div>
-              </div>
-            ))}
-
-            {/* Button at the bottom of the last chapter lane to add another chapter */}
+            {/* Outer wrapper scaled to match zoom dimensions for accurate scrollbars */}
             <div
-              className="add-chapter-bottom-bar"
+              className="canvas-zoom-sizer"
               style={{
-                top: `${
-                  chapterRanges.length > 0
-                    ? chapterRanges[chapterRanges.length - 1]!.bottom
-                    : 0
-                }px`,
+                width: `${Math.round(totalCanvasWidth * zoom)}px`,
+                height: `${Math.round(totalCanvasHeight * zoom)}px`,
               }}
             >
-              <button
-                type="button"
-                className="add-chapter-bottom-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleAddChapter();
+              <div
+                className="flowchart-canvas"
+                style={{
+                  width: `${totalCanvasWidth}px`,
+                  height: `${totalCanvasHeight}px`,
+                  transform: `scale(${zoom})`,
+                  transformOrigin: "0 0",
                 }}
               >
-                ＋ 新しい章エリア（水平レーン）を下に追加
-              </button>
-            </div>
-
-            {/* Empty state button if all nodes were deleted */}
-            {chart.nodes.length === 0 && (
-              <div className="empty-canvas-cta">
-                <p>キャンバス上に図形がありません。</p>
-                <button type="button" className="btn btn-primary" onClick={handleAddRootNode}>
-                  ＋ 最初の四角（節）を作成する
-                </button>
-              </div>
-            )}
-
-            {/* 2. SVG Connections & Stems Layer */}
-            <svg
-              className="connections-svg"
-              width={totalCanvasWidth}
-              height={totalCanvasHeight}
-            >
-              <defs>
-                <marker
-                  id="arrow-normal"
-                  viewBox="0 0 10 10"
-                  refX="8"
-                  refY="5"
-                  markerWidth="7"
-                  markerHeight="7"
-                  orient="auto-start-reverse"
-                >
-                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569" />
-                </marker>
-                <marker
-                  id="arrow-selected"
-                  viewBox="0 0 10 10"
-                  refX="8"
-                  refY="5"
-                  markerWidth="7"
-                  markerHeight="7"
-                  orient="auto-start-reverse"
-                >
-                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb" />
-                </marker>
-              </defs>
-
-              {/* 2a. Stems from each node to its circular (+) buttons */}
-              {chart.nodes.map((node) => {
-                if (node.type === "rect" && node.isEnd) {
-                  return null;
-                }
-                const bottom = getNodeBottomPoint(node);
-                const slotCount =
-                  node.type === "diamond" ? Math.max(1, node.branchCount ?? 2) : 1;
-                const diamondState =
-                  node.type === "diamond" ? getDiamondBranchState(node) : null;
-
-                return Array.from({ length: slotCount }, (_, slotIdx) => {
-                  const plusPos = getSlotPlusPosition(node, slotIdx);
-                  const isUnconnected =
-                    node.type === "diamond"
-                      ? !diamondState?.connectedSlots.has(slotIdx)
-                      : !chart.edges.some(
-                          (e) => e.sourceId === node.id && e.sourceSlot === 0
-                        );
-
-                  return (
-                    <line
-                      key={`stem-${node.id}-${slotIdx}`}
-                      x1={bottom.x}
-                      y1={bottom.y}
-                      x2={plusPos.x}
-                      y2={plusPos.y - PLUS_RADIUS}
-                      stroke={
-                        node.type === "diamond" && isUnconnected ? "#ef4444" : "#64748b"
-                      }
-                      strokeWidth={2}
-                      strokeDasharray={isUnconnected ? "4 3" : undefined}
-                    />
-                  );
-                });
-              })}
-
-              {/* 2b. Full Connecting Lines from slot (+) button to target node top */}
-              {chart.edges.map((edge) => {
-                const sourceNode = nodeMap.get(edge.sourceId);
-                const targetNode = nodeMap.get(edge.targetId);
-                if (!sourceNode || !targetNode) return null;
-                if (sourceNode.type === "rect" && sourceNode.isEnd) return null;
-
-                const startPos = getSlotPlusPosition(sourceNode, edge.sourceSlot);
-                const sx = startPos.x;
-                const sy = startPos.y + PLUS_RADIUS;
-                const endPos = getNodeTopPoint(targetNode);
-                const tx = endPos.x;
-                const ty = endPos.y;
-
-                const dy = ty - sy;
-                const controlOffset = Math.max(45, Math.abs(dy) * 0.45);
-                const pathD =
-                  dy >= 10
-                    ? `M ${sx} ${sy} C ${sx} ${sy + controlOffset}, ${tx} ${
-                        ty - controlOffset
-                      }, ${tx} ${ty}`
-                    : `M ${sx} ${sy} C ${sx} ${sy + 70}, ${tx} ${ty - 70}, ${tx} ${ty}`;
-
-                const isSelected = selectedEdgeId === edge.id;
-                const midX = (sx + tx) / 2;
-                const midY = (sy + ty) / 2;
-
-                return (
-                  <g
-                    key={edge.id}
-                    className="edge-group"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSelectedEdgeId(edge.id);
+                {/* 1. Horizontal Chapter Lanes Layer */}
+                {chapterRanges.map((ch) => (
+                  <div
+                    key={ch.id}
+                    className={`chapter-lane ${
+                      ch.index % 2 === 1 ? "chapter-lane-alt" : ""
+                    }`}
+                    style={{
+                      top: `${ch.top}px`,
+                      height: `${ch.height}px`,
                     }}
                   >
-                    {/* Invisible wider hit path for easy clicking */}
-                    <path
-                      d={pathD}
-                      fill="none"
-                      stroke="transparent"
-                      strokeWidth={14}
-                      style={{ cursor: "pointer" }}
-                    />
-                    <path
-                      d={pathD}
-                      fill="none"
-                      stroke={isSelected ? "#2563eb" : "#475569"}
-                      strokeWidth={isSelected ? 3 : 2.2}
-                      markerEnd={
-                        isSelected ? "url(#arrow-selected)" : "url(#arrow-normal)"
-                      }
-                      style={{ cursor: "pointer" }}
-                    />
-                    {isSelected && (
-                      <g
-                        transform={`translate(${midX}, ${midY})`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setChart((prev) => ({
-                            ...prev,
-                            edges: prev.edges.filter((item) => item.id !== edge.id),
-                          }));
-                          setSelectedEdgeId(null);
-                        }}
-                        style={{ cursor: "pointer" }}
-                      >
-                        <circle r={11} fill="#ef4444" stroke="#ffffff" strokeWidth={2} />
-                        <text
-                          textAnchor="middle"
-                          dominantBaseline="central"
-                          fill="#ffffff"
-                          fontSize={12}
-                          fontWeight="bold"
-                        >
-                          ×
-                        </text>
-                      </g>
-                    )}
-                  </g>
-                );
-              })}
-            </svg>
-
-            {/* 3. Nodes & Circular (+) Buttons Layer */}
-            {chart.nodes.map((node) => {
-              const isSelected = selectedNodeId === node.id;
-              const isMergeCandidate =
-                mergeMode !== null && mergeMode.sourceId !== node.id;
-              const diamondState =
-                node.type === "diamond" ? getDiamondBranchState(node) : null;
-              const slotCount =
-                node.type === "diamond"
-                  ? diamondState!.branchCount
-                  : node.isEnd
-                  ? 0
-                  : 1;
-
-              return (
-                <React.Fragment key={node.id}>
-                  {/* Shape Body (Rectangle or Diamond) */}
-                  {node.type === "rect" ? (
+                    {/* Left Sticky Header inside each Chapter Lane */}
                     <div
-                      className={`flow-node rect-node ${
-                        isSelected ? "node-selected" : ""
-                      } ${node.isEnd ? "rect-node-end" : ""} ${
-                        isMergeCandidate ? "node-merge-target" : ""
-                      }`}
-                      style={{
-                        left: `${node.x - RECT_WIDTH / 2}px`,
-                        top: `${node.y - RECT_HEIGHT / 2}px`,
-                        width: `${RECT_WIDTH}px`,
-                        height: `${RECT_HEIGHT}px`,
-                      }}
-                      onMouseDown={(e) => {
-                        if (e.button !== 0) return;
-                        e.stopPropagation();
-                        if (mergeMode) {
-                          if (mergeMode.sourceId !== node.id) {
-                            handleConnectToExistingNode(
-                              mergeMode.sourceId,
-                              mergeMode.sourceSlot,
-                              node.id
-                            );
-                          }
-                          return;
-                        }
-                        setDraggingNode({
-                          nodeId: node.id,
-                          startX: e.clientX,
-                          startY: e.clientY,
-                          origX: node.x,
-                          origY: node.y,
-                          hasMoved: false,
-                        });
-                      }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (mergeMode) return;
-                        setSelectedNodeId(node.id);
-                        setSelectedEdgeId(null);
-                        setPlusMenu(null);
-                      }}
+                      className="chapter-lane-sidebar"
+                      style={{ width: `${CHAPTER_HEADER_WIDTH}px` }}
+                      onClick={(e) => e.stopPropagation()}
                     >
-                      <div className="rect-node-header">
-                        <span className="node-kind-tag">節</span>
-                        {node.isEnd && <span className="end-flag-badge">END</span>}
-                      </div>
-                      <div className="node-title-text">
-                        {node.title.trim() || "（タイトル未入力）"}
-                      </div>
-                      <div className="node-content-preview">
-                        {node.content.trim() || "クリックしてテキストを入力..."}
-                      </div>
-                    </div>
-                  ) : (
-                    /* Diamond Node (分岐) */
-                    <div
-                      className={`flow-node diamond-node ${
-                        diamondState?.isIncomplete
-                          ? "diamond-incomplete-red"
-                          : "diamond-complete"
-                      } ${isSelected ? "node-selected" : ""} ${
-                        isMergeCandidate ? "node-merge-target" : ""
-                      }`}
-                      style={{
-                        left: `${node.x - DIAMOND_WIDTH / 2}px`,
-                        top: `${node.y - DIAMOND_HEIGHT / 2}px`,
-                        width: `${DIAMOND_WIDTH}px`,
-                        height: `${DIAMOND_HEIGHT}px`,
-                      }}
-                      onMouseDown={(e) => {
-                        if (e.button !== 0) return;
-                        e.stopPropagation();
-                        if (mergeMode) {
-                          if (mergeMode.sourceId !== node.id) {
-                            handleConnectToExistingNode(
-                              mergeMode.sourceId,
-                              mergeMode.sourceSlot,
-                              node.id
-                            );
-                          }
-                          return;
-                        }
-                        setDraggingNode({
-                          nodeId: node.id,
-                          startX: e.clientX,
-                          startY: e.clientY,
-                          origX: node.x,
-                          origY: node.y,
-                          hasMoved: false,
-                        });
-                      }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (mergeMode) return;
-                        setSelectedNodeId(node.id);
-                        setSelectedEdgeId(null);
-                        setPlusMenu(null);
-                      }}
-                    >
-                      <svg
-                        className="diamond-shape-svg"
-                        viewBox={`0 0 ${DIAMOND_WIDTH} ${DIAMOND_HEIGHT}`}
-                        width={DIAMOND_WIDTH}
-                        height={DIAMOND_HEIGHT}
-                      >
-                        <polygon
-                          points={`${DIAMOND_WIDTH / 2},3 ${DIAMOND_WIDTH - 3},${
-                            DIAMOND_HEIGHT / 2
-                          } ${DIAMOND_WIDTH / 2},${DIAMOND_HEIGHT - 3} 3,${
-                            DIAMOND_HEIGHT / 2
-                          }`}
-                          className="diamond-polygon"
-                        />
-                      </svg>
-                      <div className="diamond-inner-content">
-                        <span className="diamond-status-tag">
-                          {diamondState?.isIncomplete
-                            ? `分岐未接続 (${diamondState.connectedCount}/${diamondState.branchCount})`
-                            : `分岐 (${diamondState?.branchCount})`}
+                      <div className="chapter-badge-row">
+                        <span className="chapter-number-badge">
+                          CHAPTER {ch.index + 1}
                         </span>
-                        <div className="diamond-title-text">
-                          {node.title.trim() || "（分岐タイトル）"}
+                        <div className="chapter-mini-actions">
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            title="この章の下に新しい章を追加"
+                            onClick={() => handleAddChapter(ch.index)}
+                          >
+                            ＋
+                          </button>
+                          {chart.chapters.length > 1 && (
+                            <button
+                              type="button"
+                              className="icon-btn icon-btn-danger"
+                              title="この章エリアを削除"
+                              onClick={() => handleDeleteChapter(ch.id)}
+                            >
+                              ×
+                            </button>
+                          )}
                         </div>
                       </div>
-                    </div>
-                  )}
-
-                  {/* Circular (+) Buttons below the shape */}
-                  {Array.from({ length: slotCount }, (_, slotIdx) => {
-                    const plusPos = getSlotPlusPosition(node, slotIdx);
-                    const connectedEdge = chart.edges.find(
-                      (e) =>
-                        e.sourceId === node.id &&
-                        e.sourceSlot === slotIdx &&
-                        nodeMap.has(e.targetId)
-                    );
-                    const isMenuOpen =
-                      plusMenu?.nodeId === node.id && plusMenu?.slot === slotIdx;
-
-                    return (
-                      <button
-                        key={`plus-${node.id}-${slotIdx}`}
-                        type="button"
-                        className={`circle-plus-btn ${
-                          connectedEdge ? "circle-plus-connected" : "circle-plus-unconnected"
-                        } ${
-                          node.type === "diamond" && !connectedEdge
-                            ? "circle-plus-danger"
-                            : ""
-                        } ${isMenuOpen ? "circle-plus-active" : ""}`}
-                        style={{
-                          left: `${plusPos.x - PLUS_RADIUS}px`,
-                          top: `${plusPos.y - PLUS_RADIUS}px`,
-                          width: `${PLUS_RADIUS * 2}px`,
-                          height: `${PLUS_RADIUS * 2}px`,
-                        }}
-                        title={
-                          node.type === "diamond"
-                            ? `分岐 ${slotIdx + 1} の接続先を追加・変更`
-                            : "次の図形（四角またはひし形）を追加"
+                      <input
+                        type="text"
+                        className="chapter-title-input"
+                        value={ch.title}
+                        onChange={(e) =>
+                          handleUpdateChapterTitle(ch.id, e.target.value)
                         }
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setMergeMode(null);
-                          setPlusMenu((prev) =>
-                            prev && prev.nodeId === node.id && prev.slot === slotIdx
-                              ? null
-                              : {
-                                  nodeId: node.id,
-                                  slot: slotIdx,
-                                  x: plusPos.x,
-                                  y: plusPos.y + PLUS_RADIUS + 8,
-                                }
-                          );
-                        }}
-                      >
-                        ＋
-                      </button>
-                    );
-                  })}
-                </React.Fragment>
-              );
-            })}
-
-            {/* 4. Popover Menu when a Circular (+) Button is clicked */}
-            {plusMenu && (
-              <div
-                className="plus-popover-menu"
-                style={{
-                  left: `${Math.max(20, plusMenu.x - 115)}px`,
-                  top: `${plusMenu.y}px`,
-                }}
-                onClick={(e) => e.stopPropagation()}
-              >
-                <div className="plus-popover-header">
-                  <span>接続する図形を選択</span>
-                  <button
-                    type="button"
-                    className="popover-close-btn"
-                    onClick={() => setPlusMenu(null)}
-                  >
-                    ×
-                  </button>
-                </div>
-
-                <div className="plus-popover-choices">
-                  <button
-                    type="button"
-                    className="choice-card-btn choice-rect"
-                    onClick={() =>
-                      handleCreateChildNode(plusMenu.nodeId, plusMenu.slot, "rect")
-                    }
-                  >
-                    <span className="choice-shape-icon rect-icon">□</span>
-                    <div className="choice-label-col">
-                      <strong>四角（節）</strong>
-                      <span>通常のシナリオ節を追加</span>
+                        placeholder="章タイトルを入力..."
+                      />
+                      <div className="chapter-height-info">
+                        高さ: {Math.round(ch.height)}px
+                      </div>
                     </div>
-                  </button>
 
-                  <button
-                    type="button"
-                    className="choice-card-btn choice-diamond"
-                    onClick={() =>
-                      handleCreateChildNode(plusMenu.nodeId, plusMenu.slot, "diamond")
-                    }
-                  >
-                    <span className="choice-shape-icon diamond-icon">◇</span>
-                    <div className="choice-label-col">
-                      <strong>ひし形（分岐）</strong>
-                      <span>条件・選択肢の分岐を追加</span>
+                    {/* Horizontal Divider Line + Drag Resize Handle at bottom of chapter */}
+                    <div
+                      className="chapter-divider-line"
+                      onMouseDown={(e) => {
+                        e.stopPropagation();
+                        setResizingChapter({
+                          chapterId: ch.id,
+                          startY: e.clientY,
+                          origHeight: ch.height,
+                          chapterBottomYAtStart: ch.bottom,
+                          shiftNodesBelow: !e.altKey,
+                        });
+                      }}
+                      title="上下にドラッグして章エリアの高さを変更（Altキーを押しながらで下部ノード位置を固定）"
+                    >
+                      <span className="chapter-resize-pill">
+                        ⇕ 章の境界線（ドラッグで高さ調整）
+                      </span>
                     </div>
-                  </button>
-                </div>
+                  </div>
+                ))}
 
-                <div className="plus-popover-divider" />
-
-                <button
-                  type="button"
-                  className="merge-action-btn"
-                  onClick={() => {
-                    setMergeMode({
-                      sourceId: plusMenu.nodeId,
-                      sourceSlot: plusMenu.slot,
-                    });
-                    setPlusMenu(null);
+                {/* Button at the bottom of the last chapter lane to add another chapter */}
+                <div
+                  className="add-chapter-bottom-bar"
+                  style={{
+                    top: `${
+                      chapterRanges.length > 0
+                        ? chapterRanges[chapterRanges.length - 1]!.bottom
+                        : 0
+                    }px`,
                   }}
                 >
-                  🔗 既存の図形へ合流（キャンバスで選択）
-                </button>
-
-                {chart.edges.some(
-                  (e) =>
-                    e.sourceId === plusMenu.nodeId && e.sourceSlot === plusMenu.slot
-                ) && (
                   <button
                     type="button"
-                    className="disconnect-action-btn"
-                    onClick={() =>
-                      handleDisconnectSlot(plusMenu.nodeId, plusMenu.slot)
-                    }
+                    className="add-chapter-bottom-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleAddChapter();
+                    }}
                   >
-                    ✕ 現在の接続線を解除する
+                    ＋ 新しい章エリア（水平レーン）を下に追加
                   </button>
+                </div>
+
+                {/* Empty state button if all nodes were deleted */}
+                {chart.nodes.length === 0 && (
+                  <div className="empty-canvas-cta">
+                    <p>キャンバス上に図形がありません。</p>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={handleAddRootNode}
+                    >
+                      ＋ 最初の四角（節）を作成する
+                    </button>
+                  </div>
+                )}
+
+                {/* 2. SVG Connections & Stems Layer */}
+                <svg
+                  className="connections-svg"
+                  width={totalCanvasWidth}
+                  height={totalCanvasHeight}
+                >
+                  <defs>
+                    <marker
+                      id="arrow-normal"
+                      viewBox="0 0 10 10"
+                      refX="8"
+                      refY="5"
+                      markerWidth="7"
+                      markerHeight="7"
+                      orient="auto-start-reverse"
+                    >
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569" />
+                    </marker>
+                    <marker
+                      id="arrow-selected"
+                      viewBox="0 0 10 10"
+                      refX="8"
+                      refY="5"
+                      markerWidth="7"
+                      markerHeight="7"
+                      orient="auto-start-reverse"
+                    >
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb" />
+                    </marker>
+                  </defs>
+
+                  {/* 2a. Stems from each node to its circular (+) buttons */}
+                  {chart.nodes.map((node) => {
+                    if (node.type === "rect" && node.isEnd) {
+                      return null;
+                    }
+                    const bottom = getNodeBottomPoint(node);
+                    const slotCount = getNodeSlotCount(node);
+                    const branchState = getNodeBranchState(node);
+
+                    return Array.from({ length: slotCount }, (_, slotIdx) => {
+                      const plusPos = getSlotPlusPosition(node, slotIdx);
+                      const isUnconnected = !branchState.connectedSlots.has(slotIdx);
+
+                      return (
+                        <line
+                          key={`stem-${node.id}-${slotIdx}`}
+                          x1={bottom.x}
+                          y1={bottom.y}
+                          x2={plusPos.x}
+                          y2={plusPos.y - PLUS_RADIUS}
+                          stroke={
+                            node.type === "diamond" && isUnconnected
+                              ? "#ef4444"
+                              : "#64748b"
+                          }
+                          strokeWidth={2}
+                          strokeDasharray={isUnconnected ? "4 3" : undefined}
+                        />
+                      );
+                    });
+                  })}
+
+                  {/* 2b. Full Connecting Lines from slot (+) button to target node top */}
+                  {chart.edges.map((edge) => {
+                    const sourceNode = nodeMap.get(edge.sourceId);
+                    const targetNode = nodeMap.get(edge.targetId);
+                    if (!sourceNode || !targetNode) return null;
+                    if (sourceNode.type === "rect" && sourceNode.isEnd) return null;
+
+                    const startPos = getSlotPlusPosition(sourceNode, edge.sourceSlot);
+                    const sx = startPos.x;
+                    const sy = startPos.y + PLUS_RADIUS;
+                    const endPos = getNodeTopPoint(targetNode);
+                    const tx = endPos.x;
+                    const ty = endPos.y;
+
+                    const dy = ty - sy;
+                    const controlOffset = Math.max(45, Math.abs(dy) * 0.45);
+                    const pathD =
+                      dy >= 10
+                        ? `M ${sx} ${sy} C ${sx} ${sy + controlOffset}, ${tx} ${
+                            ty - controlOffset
+                          }, ${tx} ${ty}`
+                        : `M ${sx} ${sy} C ${sx} ${sy + 70}, ${tx} ${
+                            ty - 70
+                          }, ${tx} ${ty}`;
+
+                    const isSelected = selectedEdgeId === edge.id;
+
+                    return (
+                      <g
+                        key={edge.id}
+                        className="edge-group"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedEdgeId(edge.id);
+                          setPlusMenu(null);
+                        }}
+                      >
+                        <path
+                          d={pathD}
+                          fill="none"
+                          stroke="transparent"
+                          strokeWidth={16}
+                          style={{ cursor: "pointer" }}
+                        />
+                        <path
+                          d={pathD}
+                          fill="none"
+                          stroke={isSelected ? "#2563eb" : "#475569"}
+                          strokeWidth={isSelected ? 3.2 : 2.2}
+                          markerEnd={
+                            isSelected ? "url(#arrow-selected)" : "url(#arrow-normal)"
+                          }
+                          style={{ cursor: "pointer" }}
+                        />
+                      </g>
+                    );
+                  })}
+                </svg>
+
+                {/* 2c. Edge Comment Badges & Interactive Popover on Lines */}
+                {chart.edges.map((edge) => {
+                  const sourceNode = nodeMap.get(edge.sourceId);
+                  const targetNode = nodeMap.get(edge.targetId);
+                  if (!sourceNode || !targetNode) return null;
+                  if (sourceNode.type === "rect" && sourceNode.isEnd) return null;
+
+                  const startPos = getSlotPlusPosition(sourceNode, edge.sourceSlot);
+                  const sx = startPos.x;
+                  const sy = startPos.y + PLUS_RADIUS;
+                  const endPos = getNodeTopPoint(targetNode);
+                  const tx = endPos.x;
+                  const ty = endPos.y;
+
+                  const midX = (sx + tx) / 2;
+                  const midY = (sy + ty) / 2;
+                  const hasLabel = Boolean(edge.label && edge.label.trim().length > 0);
+                  const isSelected = selectedEdgeId === edge.id;
+
+                  if (!hasLabel && !isSelected) return null;
+
+                  return (
+                    <div
+                      key={`edge-label-${edge.id}`}
+                      className={`edge-label-anchor ${
+                        isSelected ? "edge-label-selected" : ""
+                      }`}
+                      style={{
+                        left: `${midX}px`,
+                        top: `${midY}px`,
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedEdgeId(edge.id);
+                        setPlusMenu(null);
+                      }}
+                    >
+                      {isSelected ? (
+                        <div className="edge-comment-editor">
+                          <input
+                            type="text"
+                            className="edge-comment-input"
+                            value={edge.label ?? ""}
+                            autoFocus
+                            onChange={(e) =>
+                              handleUpdateEdgeLabel(edge.id, e.target.value)
+                            }
+                            placeholder="例：SAN値が80以下の場合"
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                setSelectedEdgeId(null);
+                              }
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="edge-comment-done-btn"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedEdgeId(null);
+                            }}
+                            title="閉じる"
+                          >
+                            ✓
+                          </button>
+                          <button
+                            type="button"
+                            className="edge-comment-delete-btn"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setChart((prev) => ({
+                                ...prev,
+                                edges: prev.edges.filter((item) => item.id !== edge.id),
+                              }));
+                              setSelectedEdgeId(null);
+                            }}
+                            title="この接続線を削除"
+                          >
+                            🗑
+                          </button>
+                        </div>
+                      ) : (
+                        <div
+                          className="edge-comment-pill"
+                          title="クリックして線のコメントを編集"
+                        >
+                          {edge.label}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* 3. Nodes & Circular (+) Buttons Layer */}
+                {chart.nodes.map((node) => {
+                  const isSelected = selectedNodeId === node.id;
+                  const isMergeCandidate =
+                    mergeMode !== null && mergeMode.sourceId !== node.id;
+                  const branchState = getNodeBranchState(node);
+                  const slotCount = branchState.branchCount;
+
+                  return (
+                    <React.Fragment key={node.id}>
+                      {/* Shape Body (Rectangle or Diamond) */}
+                      {node.type === "rect" ? (
+                        <div
+                          className={`flow-node rect-node ${
+                            isSelected ? "node-selected" : ""
+                          } ${node.isEnd ? "rect-node-end" : ""} ${
+                            isMergeCandidate ? "node-merge-target" : ""
+                          }`}
+                          style={{
+                            left: `${node.x - RECT_WIDTH / 2}px`,
+                            top: `${node.y - RECT_HEIGHT / 2}px`,
+                            width: `${RECT_WIDTH}px`,
+                            height: `${RECT_HEIGHT}px`,
+                          }}
+                          onMouseDown={(e) => {
+                            if (e.button !== 0) return;
+                            e.stopPropagation();
+                            if (mergeMode) {
+                              if (mergeMode.sourceId !== node.id) {
+                                handleConnectToExistingNode(
+                                  mergeMode.sourceId,
+                                  mergeMode.sourceSlot,
+                                  node.id
+                                );
+                              }
+                              return;
+                            }
+                            setDraggingNode({
+                              nodeId: node.id,
+                              startX: e.clientX,
+                              startY: e.clientY,
+                              origX: node.x,
+                              origY: node.y,
+                              hasMoved: false,
+                            });
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (mergeMode) return;
+                            setSelectedNodeId(node.id);
+                            setSelectedEdgeId(null);
+                            setPlusMenu(null);
+                          }}
+                        >
+                          <div className="rect-node-header">
+                            <span className="node-kind-tag">
+                              {!node.isEnd && slotCount > 1
+                                ? `節 (${slotCount}分岐)`
+                                : "節"}
+                            </span>
+                            {node.isEnd && <span className="end-flag-badge">END</span>}
+                          </div>
+                          <div className="node-title-text">
+                            {node.title.trim() || "（タイトル未入力）"}
+                          </div>
+                          <div className="node-content-preview">
+                            {node.content.trim() || "クリックしてテキストを入力..."}
+                          </div>
+                        </div>
+                      ) : (
+                        /* Diamond Node (分岐) */
+                        <div
+                          className={`flow-node diamond-node ${
+                            branchState.isIncomplete
+                              ? "diamond-incomplete-red"
+                              : "diamond-complete"
+                          } ${isSelected ? "node-selected" : ""} ${
+                            isMergeCandidate ? "node-merge-target" : ""
+                          }`}
+                          style={{
+                            left: `${node.x - DIAMOND_WIDTH / 2}px`,
+                            top: `${node.y - DIAMOND_HEIGHT / 2}px`,
+                            width: `${DIAMOND_WIDTH}px`,
+                            height: `${DIAMOND_HEIGHT}px`,
+                          }}
+                          onMouseDown={(e) => {
+                            if (e.button !== 0) return;
+                            e.stopPropagation();
+                            if (mergeMode) {
+                              if (mergeMode.sourceId !== node.id) {
+                                handleConnectToExistingNode(
+                                  mergeMode.sourceId,
+                                  mergeMode.sourceSlot,
+                                  node.id
+                                );
+                              }
+                              return;
+                            }
+                            setDraggingNode({
+                              nodeId: node.id,
+                              startX: e.clientX,
+                              startY: e.clientY,
+                              origX: node.x,
+                              origY: node.y,
+                              hasMoved: false,
+                            });
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (mergeMode) return;
+                            setSelectedNodeId(node.id);
+                            setSelectedEdgeId(null);
+                            setPlusMenu(null);
+                          }}
+                        >
+                          <svg
+                            className="diamond-shape-svg"
+                            viewBox={`0 0 ${DIAMOND_WIDTH} ${DIAMOND_HEIGHT}`}
+                            width={DIAMOND_WIDTH}
+                            height={DIAMOND_HEIGHT}
+                          >
+                            <polygon
+                              points={`${DIAMOND_WIDTH / 2},3 ${DIAMOND_WIDTH - 3},${
+                                DIAMOND_HEIGHT / 2
+                              } ${DIAMOND_WIDTH / 2},${DIAMOND_HEIGHT - 3} 3,${
+                                DIAMOND_HEIGHT / 2
+                              }`}
+                              className="diamond-polygon"
+                            />
+                          </svg>
+                          <div className="diamond-inner-content">
+                            <span className="diamond-status-tag">
+                              {branchState.isIncomplete
+                                ? `分岐未接続 (${branchState.connectedCount}/${branchState.branchCount})`
+                                : `分岐 (${branchState.branchCount})`}
+                            </span>
+                            <div className="diamond-title-text">
+                              {node.title.trim() || "（分岐タイトル）"}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Circular (+) Buttons below the shape */}
+                      {Array.from({ length: slotCount }, (_, slotIdx) => {
+                        const plusPos = getSlotPlusPosition(node, slotIdx);
+                        const connectedEdge = chart.edges.find(
+                          (e) =>
+                            e.sourceId === node.id &&
+                            e.sourceSlot === slotIdx &&
+                            nodeMap.has(e.targetId)
+                        );
+                        const isMenuOpen =
+                          plusMenu?.nodeId === node.id && plusMenu?.slot === slotIdx;
+
+                        return (
+                          <button
+                            key={`plus-${node.id}-${slotIdx}`}
+                            type="button"
+                            className={`circle-plus-btn ${
+                              connectedEdge
+                                ? "circle-plus-connected"
+                                : "circle-plus-unconnected"
+                            } ${
+                              node.type === "diamond" && !connectedEdge
+                                ? "circle-plus-danger"
+                                : ""
+                            } ${isMenuOpen ? "circle-plus-active" : ""}`}
+                            style={{
+                              left: `${plusPos.x - PLUS_RADIUS}px`,
+                              top: `${plusPos.y - PLUS_RADIUS}px`,
+                              width: `${PLUS_RADIUS * 2}px`,
+                              height: `${PLUS_RADIUS * 2}px`,
+                            }}
+                            title={
+                              slotCount > 1
+                                ? `分岐 ${slotIdx + 1} の接続先を追加・変更`
+                                : "次の図形（四角またはひし形）を追加"
+                            }
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setMergeMode(null);
+                              setPlusMenu((prev) =>
+                                prev &&
+                                prev.nodeId === node.id &&
+                                prev.slot === slotIdx
+                                  ? null
+                                  : {
+                                      nodeId: node.id,
+                                      slot: slotIdx,
+                                      x: plusPos.x,
+                                      y: plusPos.y + PLUS_RADIUS + 8,
+                                    }
+                              );
+                            }}
+                          >
+                            ＋
+                          </button>
+                        );
+                      })}
+                    </React.Fragment>
+                  );
+                })}
+
+                {/* 4. Popover Menu when a Circular (+) Button is clicked */}
+                {plusMenu && (
+                  <div
+                    className="plus-popover-menu"
+                    style={{
+                      left: `${Math.max(20, plusMenu.x - 115)}px`,
+                      top: `${plusMenu.y}px`,
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="plus-popover-header">
+                      <span>接続する図形を選択</span>
+                      <button
+                        type="button"
+                        className="popover-close-btn"
+                        onClick={() => setPlusMenu(null)}
+                      >
+                        ×
+                      </button>
+                    </div>
+
+                    <div className="plus-popover-choices">
+                      <button
+                        type="button"
+                        className="choice-card-btn choice-rect"
+                        onClick={() =>
+                          handleCreateChildNode(plusMenu.nodeId, plusMenu.slot, "rect")
+                        }
+                      >
+                        <span className="choice-shape-icon rect-icon">□</span>
+                        <div className="choice-label-col">
+                          <strong>四角（節）</strong>
+                          <span>通常のシナリオ節を追加</span>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        className="choice-card-btn choice-diamond"
+                        onClick={() =>
+                          handleCreateChildNode(
+                            plusMenu.nodeId,
+                            plusMenu.slot,
+                            "diamond"
+                          )
+                        }
+                      >
+                        <span className="choice-shape-icon diamond-icon">◇</span>
+                        <div className="choice-label-col">
+                          <strong>ひし形（分岐）</strong>
+                          <span>条件・選択肢の分岐を追加</span>
+                        </div>
+                      </button>
+                    </div>
+
+                    <div className="plus-popover-divider" />
+
+                    <button
+                      type="button"
+                      className="merge-action-btn"
+                      onClick={() => {
+                        setMergeMode({
+                          sourceId: plusMenu.nodeId,
+                          sourceSlot: plusMenu.slot,
+                        });
+                        setPlusMenu(null);
+                      }}
+                    >
+                      🔗 既存の図形へ合流（キャンバスで選択）
+                    </button>
+
+                    {chart.edges.some(
+                      (e) =>
+                        e.sourceId === plusMenu.nodeId && e.sourceSlot === plusMenu.slot
+                    ) && (
+                      <button
+                        type="button"
+                        className="disconnect-action-btn"
+                        onClick={() =>
+                          handleDisconnectSlot(plusMenu.nodeId, plusMenu.slot)
+                        }
+                      >
+                        ✕ 現在の接続線を解除する
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
-            )}
+            </div>
+          </div>
+
+          {/* Bottom-Right Floating Zoom Controls (＋ / － / リセット) */}
+          <div
+            className="floating-zoom-controls"
+            onClick={(e) => e.stopPropagation()}
+            title="Ctrl + マウスホイールでも拡大・縮小できます"
+          >
+            <button
+              type="button"
+              className="zoom-ctrl-btn"
+              onClick={() => setZoom((z) => clampZoom(z - ZOOM_STEP))}
+              disabled={zoom <= MIN_ZOOM}
+              title="縮小 (Zoom Out)"
+            >
+              －
+            </button>
+            <button
+              type="button"
+              className="zoom-percent-btn"
+              onClick={() => setZoom(1.0)}
+              title="クリックで100%にリセット（Ctrl+スクロール対応）"
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              className="zoom-ctrl-btn"
+              onClick={() => setZoom((z) => clampZoom(z + ZOOM_STEP))}
+              disabled={zoom >= MAX_ZOOM}
+              title="拡大 (Zoom In)"
+            >
+              ＋
+            </button>
           </div>
         </div>
 
@@ -1276,7 +1720,7 @@ export function App() {
                   ) : (
                     <span
                       className={`drawer-badge ${
-                        getDiamondBranchState(selectedNode).isIncomplete
+                        getNodeBranchState(selectedNode).isIncomplete
                           ? "badge-diamond-red"
                           : "badge-diamond"
                       }`}
@@ -1330,7 +1774,7 @@ export function App() {
                   <textarea
                     id="node-content-textarea"
                     className="form-textarea"
-                    rows={10}
+                    rows={8}
                     value={selectedNode.content}
                     onChange={(e) =>
                       updateNode(selectedNode.id, { content: e.target.value })
@@ -1363,25 +1807,31 @@ export function App() {
                   </div>
                 )}
 
-                {/* 3B. ひし形（分岐）のドロワーでのみ表示：分岐先の個数 */}
-                {selectedNode.type === "diamond" && (
+                {/* 3B. 分岐先の個数（ひし形、およびENDではない四角で選択可能） */}
+                {(selectedNode.type === "diamond" ||
+                  (selectedNode.type === "rect" && !selectedNode.isEnd)) && (
                   <div className="form-group special-box diamond-special-box">
                     <label className="form-label" htmlFor="node-branch-count">
-                      分岐先の個数
+                      {selectedNode.type === "diamond"
+                        ? "分岐先の個数"
+                        : "この節からの分岐数（複数ルートへの分岐）"}
                     </label>
                     <div className="branch-count-controls">
-                      {[2, 3, 4, 5, 6].map((num) => (
+                      {(selectedNode.type === "rect"
+                        ? [1, 2, 3, 4, 5]
+                        : [2, 3, 4, 5, 6]
+                      ).map((num) => (
                         <button
                           key={num}
                           type="button"
                           className={`branch-num-btn ${
-                            (selectedNode.branchCount ?? 2) === num ? "active" : ""
+                            getNodeSlotCount(selectedNode) === num ? "active" : ""
                           }`}
                           onClick={() =>
                             updateNode(selectedNode.id, { branchCount: num })
                           }
                         >
-                          {num}分岐
+                          {num === 1 ? "1（通常）" : `${num}分岐`}
                         </button>
                       ))}
                       <input
@@ -1390,7 +1840,7 @@ export function App() {
                         min={1}
                         max={10}
                         className="branch-number-input"
-                        value={selectedNode.branchCount ?? 2}
+                        value={getNodeSlotCount(selectedNode)}
                         onChange={(e) => {
                           const val = Math.max(
                             1,
@@ -1400,23 +1850,27 @@ export function App() {
                         }}
                       />
                     </div>
-                    {getDiamondBranchState(selectedNode).isIncomplete ? (
-                      <p className="branch-warning-text">
-                        ⚠ 未作成の分岐先があるため、ひし形が赤色で表示されています（
-                        {getDiamondBranchState(selectedNode).connectedCount} /{" "}
-                        {getDiamondBranchState(selectedNode).branchCount} 接続済）。
-                      </p>
-                    ) : (
-                      <p className="branch-ok-text">
-                        ✓ すべての分岐先（{selectedNode.branchCount ?? 2}個）が接続されています。
-                      </p>
-                    )}
+                    {selectedNode.type === "diamond" &&
+                      (getNodeBranchState(selectedNode).isIncomplete ? (
+                        <p className="branch-warning-text">
+                          ⚠ 未作成の分岐先があるため、ひし形が赤色で表示されています（
+                          {getNodeBranchState(selectedNode).connectedCount} /{" "}
+                          {getNodeBranchState(selectedNode).branchCount} 接続済）。
+                        </p>
+                      ) : (
+                        <p className="branch-ok-text">
+                          ✓ すべての分岐先（{getNodeSlotCount(selectedNode)}
+                          個）が接続されています。
+                        </p>
+                      ))}
                   </div>
                 )}
 
-                {/* 接続状態の簡易一覧 */}
+                {/* 4. 下流への接続状況 ＆ 分岐線のコメント入力 */}
                 <div className="drawer-connections-section">
-                  <div className="form-label">下流への接続状況</div>
+                  <div className="form-label">
+                    下流への接続と線のコメント（条件メモ）
+                  </div>
                   {selectedNode.type === "rect" && selectedNode.isEnd ? (
                     <div className="connection-empty-note">
                       END設定中のため下流への接続はありません。
@@ -1424,12 +1878,7 @@ export function App() {
                   ) : (
                     <div className="slot-status-list">
                       {Array.from(
-                        {
-                          length:
-                            selectedNode.type === "diamond"
-                              ? Math.max(1, selectedNode.branchCount ?? 2)
-                              : 1,
-                        },
+                        { length: getNodeSlotCount(selectedNode) },
                         (_, slotIdx) => {
                           const edge = chart.edges.find(
                             (e) =>
@@ -1439,34 +1888,49 @@ export function App() {
                           );
                           const target = edge ? nodeMap.get(edge.targetId) : null;
                           return (
-                            <div key={slotIdx} className="slot-status-item">
-                              <span className="slot-index-label">
-                                {selectedNode.type === "diamond"
-                                  ? `分岐 ${slotIdx + 1}`
-                                  : "次節"}
-                              </span>
-                              {target ? (
-                                <div className="slot-target-info">
-                                  <span
-                                    className="slot-target-link"
-                                    onClick={() => setSelectedNodeId(target.id)}
-                                  >
-                                    → {target.title || "（無題）"}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    className="slot-unlink-btn"
-                                    onClick={() =>
-                                      handleDisconnectSlot(selectedNode.id, slotIdx)
-                                    }
-                                  >
-                                    解除
-                                  </button>
-                                </div>
-                              ) : (
-                                <span className="slot-unconnected-badge">
-                                  未作成（下の＋ボタンから追加）
+                            <div key={slotIdx} className="slot-status-card">
+                              <div className="slot-status-item">
+                                <span className="slot-index-label">
+                                  {getNodeSlotCount(selectedNode) > 1
+                                    ? `分岐 ${slotIdx + 1}`
+                                    : "接続先"}
                                 </span>
+                                {target ? (
+                                  <div className="slot-target-info">
+                                    <span
+                                      className="slot-target-link"
+                                      onClick={() => setSelectedNodeId(target.id)}
+                                    >
+                                      → {target.title || "（無題）"}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="slot-unlink-btn"
+                                      onClick={() =>
+                                        handleDisconnectSlot(selectedNode.id, slotIdx)
+                                      }
+                                    >
+                                      解除
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <span className="slot-unconnected-badge">
+                                    未作成（下の＋ボタンから追加）
+                                  </span>
+                                )}
+                              </div>
+                              {edge && (
+                                <div className="slot-edge-comment-row">
+                                  <input
+                                    type="text"
+                                    className="slot-edge-comment-input"
+                                    value={edge.label ?? ""}
+                                    onChange={(e) =>
+                                      handleUpdateEdgeLabel(edge.id, e.target.value)
+                                    }
+                                    placeholder="線のコメント（例：SAN値が80以下の場合）"
+                                  />
+                                </div>
                               )}
                             </div>
                           );

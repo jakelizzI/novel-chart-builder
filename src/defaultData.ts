@@ -33,6 +33,7 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         x: 520,
         y: 85,
         isEnd: false,
+        branchCount: 1,
       },
       {
         id: "node-2",
@@ -51,6 +52,7 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         x: 330,
         y: 440,
         isEnd: false,
+        branchCount: 1,
       },
       {
         id: "node-4",
@@ -60,6 +62,7 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         x: 710,
         y: 440,
         isEnd: false,
+        branchCount: 1,
       },
       {
         id: "node-5",
@@ -78,6 +81,7 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         x: 330,
         y: 820,
         isEnd: true,
+        branchCount: 1,
       },
     ],
     edges: [
@@ -86,30 +90,35 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         sourceId: "node-1",
         sourceSlot: 0,
         targetId: "node-2",
+        label: "",
       },
       {
         id: "edge-2",
         sourceId: "node-2",
         sourceSlot: 0,
         targetId: "node-3",
+        label: "左の扉へ",
       },
       {
         id: "edge-3",
         sourceId: "node-2",
         sourceSlot: 1,
         targetId: "node-4",
+        label: "SAN値が80以下の場合",
       },
       {
         id: "edge-4",
         sourceId: "node-3",
         sourceSlot: 0,
         targetId: "node-5",
+        label: "",
       },
       {
         id: "edge-5",
         sourceId: "node-5",
         sourceSlot: 0,
         targetId: "node-6",
+        label: "銀の鍵を使う",
       },
     ],
   };
@@ -142,6 +151,7 @@ export function createMinimalFlowchart(id: string, name: string): FlowchartData 
         x: 520,
         y: 110,
         isEnd: false,
+        branchCount: 1,
       },
     ],
     edges: [],
