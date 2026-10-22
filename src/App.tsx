@@ -70,6 +70,441 @@ function getSlotPlusPosition(node: FlowNode, slot: number): { x: number; y: numb
   return { x: bottom.x + offsetX, y: bottom.y + PLUS_OFFSET_Y };
 }
 
+/**
+ * Compute cubic Bezier path and midpoint for an edge, automatically detouring
+ * around any intermediate nodes that would otherwise hide the line.
+ */
+function computeEdgeGeometry(
+  edge: FlowEdge,
+  sourceNode: FlowNode,
+  targetNode: FlowNode,
+  allNodes: FlowNode[]
+): { pathD: string; midX: number; midY: number } {
+  const startPos = getSlotPlusPosition(sourceNode, edge.sourceSlot);
+  const sx = startPos.x;
+  const sy = startPos.y + PLUS_RADIUS;
+  const endPos = getNodeTopPoint(targetNode);
+  const tx = endPos.x;
+  const ty = endPos.y;
+
+  const dy = ty - sy;
+  const minY = Math.min(sy, ty);
+  const maxY = Math.max(sy, ty);
+
+  // Check if any intermediate node lies in the vertical range and close to the straight segment
+  const obstacles = allNodes.filter((n) => {
+    if (n.id === sourceNode.id || n.id === targetNode.id) return false;
+    return n.y > minY + 15 && n.y < maxY - 15;
+  });
+
+  let cx1 = sx;
+  let cy1 = dy >= 10 ? sy + Math.max(45, Math.abs(dy) * 0.45) : sy + 70;
+  let cx2 = tx;
+  let cy2 = dy >= 10 ? ty - Math.max(45, Math.abs(dy) * 0.45) : ty - 70;
+
+  for (const obs of obstacles) {
+    const ratio = (obs.y - sy) / (ty - sy || 1);
+    const lineXAtObs = sx + (tx - sx) * ratio;
+    const dist = lineXAtObs - obs.x;
+    const clearance = (obs.type === "diamond" ? DIAMOND_WIDTH : RECT_WIDTH) / 2 + 45;
+
+    if (Math.abs(dist) < clearance) {
+      // Determine direction to curve around the obstacle
+      const dir =
+        Math.abs(dist) > 4
+          ? Math.sign(dist)
+          : edge.sourceSlot > 0
+          ? 1
+          : -1;
+      const desiredMidX = obs.x + dir * (clearance + 25);
+      // Cubic bezier at t=0.5 has X(0.5) = 0.125*(sx + tx) + 0.375*(cx1 + cx2)
+      const controlX = (desiredMidX - 0.125 * (sx + tx)) / 0.75;
+      cx1 = controlX;
+      cx2 = controlX;
+      cy1 = sy + (ty - sy) * 0.3;
+      cy2 = sy + (ty - sy) * 0.7;
+    }
+  }
+
+  const pathD = `M ${sx} ${sy} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${tx} ${ty}`;
+  // Exact point on the cubic Bezier curve at t = 0.5
+  const midX = 0.125 * sx + 0.375 * cx1 + 0.375 * cx2 + 0.125 * tx;
+  const midY = 0.125 * sy + 0.375 * cy1 + 0.375 * cy2 + 0.125 * ty;
+
+  return { pathD, midX, midY };
+}
+
+/**
+ * Hierarchical DAG Auto-Sort (Sugiyama-style with dummy pass-through nodes
+ * and explicit line-vs-node collision avoidance so skip-level edges never hide behind nodes).
+ */
+export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
+  if (prev.nodes.length === 0) return prev;
+
+  const validIds = new Set(prev.nodes.map((n) => n.id));
+  const validEdges = prev.edges.filter(
+    (e) => validIds.has(e.sourceId) && validIds.has(e.targetId) && e.sourceId !== e.targetId
+  );
+
+  const inDegree = new Map<string, number>();
+  const outEdges = new Map<string, FlowEdge[]>();
+
+  for (const n of prev.nodes) {
+    inDegree.set(n.id, 0);
+    outEdges.set(n.id, []);
+  }
+
+  for (const e of validEdges) {
+    inDegree.set(e.targetId, (inDegree.get(e.targetId) ?? 0) + 1);
+    outEdges.get(e.sourceId)?.push(e);
+  }
+
+  for (const list of outEdges.values()) {
+    list.sort((a, b) => a.sourceSlot - b.sourceSlot);
+  }
+
+  // 1. Identify root nodes (inDegree === 0)
+  let roots = prev.nodes
+    .filter((n) => (inDegree.get(n.id) ?? 0) === 0)
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+
+  if (roots.length === 0) {
+    const sortedByY = [...prev.nodes].sort((a, b) => a.y - b.y || a.x - b.x);
+    roots = [sortedByY[0]!];
+  }
+
+  // 2. Longest-path layering (so a node is always strictly below all its ancestors)
+  const layerMap = new Map<string, number>();
+  const queue: Array<{ id: string; depth: number; path: Set<string> }> = [];
+
+  for (const r of roots) {
+    layerMap.set(r.id, 0);
+    queue.push({ id: r.id, depth: 0, path: new Set([r.id]) });
+  }
+
+  while (queue.length > 0) {
+    const curr = queue.shift()!;
+    const edgesFromCurr = outEdges.get(curr.id) ?? [];
+    for (const edge of edgesFromCurr) {
+      if (curr.path.has(edge.targetId)) continue;
+      const nextDepth = curr.depth + 1;
+      const prevDepth = layerMap.get(edge.targetId) ?? -1;
+      if (nextDepth > prevDepth) {
+        layerMap.set(edge.targetId, nextDepth);
+        const nextPath = new Set(curr.path);
+        nextPath.add(edge.targetId);
+        queue.push({ id: edge.targetId, depth: nextDepth, path: nextPath });
+      }
+    }
+  }
+
+  for (const n of prev.nodes) {
+    if (!layerMap.has(n.id)) {
+      layerMap.set(n.id, 0);
+    }
+  }
+
+  const maxLayer = Math.max(0, ...Array.from(layerMap.values()));
+
+  // 3. Build augmented layer graph with Dummy Nodes for edges spanning > 1 layer
+  interface LayoutItem {
+    id: string;
+    isDummy: boolean;
+    layer: number;
+    origX: number;
+  }
+
+  interface LayoutSegment {
+    fromId: string;
+    toId: string;
+    slot: number;
+  }
+
+  const itemsById = new Map<string, LayoutItem>();
+  const layerItems: LayoutItem[][] = Array.from({ length: maxLayer + 1 }, () => []);
+  const segmentsIn = new Map<string, LayoutSegment[]>();
+  const segmentsOut = new Map<string, LayoutSegment[]>();
+
+  for (const n of prev.nodes) {
+    const l = layerMap.get(n.id) ?? 0;
+    const item: LayoutItem = { id: n.id, isDummy: false, layer: l, origX: n.x };
+    itemsById.set(n.id, item);
+    layerItems[l]!.push(item);
+    segmentsIn.set(n.id, []);
+    segmentsOut.set(n.id, []);
+  }
+
+  let dummyCounter = 0;
+  for (const e of validEdges) {
+    const uLayer = layerMap.get(e.sourceId) ?? 0;
+    const vLayer = layerMap.get(e.targetId) ?? 0;
+    if (vLayer <= uLayer) continue; // ignore back/same-layer edges for hierarchy
+
+    if (vLayer - uLayer === 1) {
+      const seg: LayoutSegment = {
+        fromId: e.sourceId,
+        toId: e.targetId,
+        slot: e.sourceSlot,
+      };
+      segmentsOut.get(e.sourceId)?.push(seg);
+      segmentsIn.get(e.targetId)?.push(seg);
+    } else {
+      // Split long edge (e.g. 導入 -> ３節) into 1-layer segments with dummy nodes
+      let prevId = e.sourceId;
+      let prevSlot = e.sourceSlot;
+      const uNode = itemsById.get(e.sourceId)!;
+
+      for (let l = uLayer + 1; l < vLayer; l++) {
+        const dummyId = `__dummy_${++dummyCounter}`;
+        const dummyItem: LayoutItem = {
+          id: dummyId,
+          isDummy: true,
+          layer: l,
+          origX: uNode.origX + (e.sourceSlot + 1) * 50,
+        };
+        itemsById.set(dummyId, dummyItem);
+        layerItems[l]!.push(dummyItem);
+        segmentsIn.set(dummyId, []);
+        segmentsOut.set(dummyId, []);
+
+        const seg: LayoutSegment = { fromId: prevId, toId: dummyId, slot: prevSlot };
+        segmentsOut.get(prevId)?.push(seg);
+        segmentsIn.get(dummyId)?.push(seg);
+
+        prevId = dummyId;
+        prevSlot = 0;
+      }
+
+      const lastSeg: LayoutSegment = {
+        fromId: prevId,
+        toId: e.targetId,
+        slot: prevSlot,
+      };
+      segmentsOut.get(prevId)?.push(lastSeg);
+      segmentsIn.get(e.targetId)?.push(lastSeg);
+    }
+  }
+
+  // 4. Order items within each layer using barycenter + slot order
+  const orderInLayer = new Map<string, number>();
+  layerItems[0]!.sort((a, b) => a.origX - b.origX);
+  layerItems[0]!.forEach((item, idx) => orderInLayer.set(item.id, idx));
+
+  for (let l = 1; l <= maxLayer; l++) {
+    const items = layerItems[l]!;
+    items.sort((a, b) => {
+      const aIn = segmentsIn.get(a.id) ?? [];
+      const bIn = segmentsIn.get(b.id) ?? [];
+      const aScore =
+        aIn.length > 0
+          ? aIn.reduce(
+              (sum, s) => sum + (orderInLayer.get(s.fromId) ?? 0) * 100 + s.slot * 15,
+              0
+            ) / aIn.length
+          : a.origX;
+      const bScore =
+        bIn.length > 0
+          ? bIn.reduce(
+              (sum, s) => sum + (orderInLayer.get(s.fromId) ?? 0) * 100 + s.slot * 15,
+              0
+            ) / bIn.length
+          : b.origX;
+
+      // Place real nodes before dummy nodes when tied so real nodes sit cleanly on the left/right
+      if (Math.abs(aScore - bScore) < 0.01 && a.isDummy !== b.isDummy) {
+        return a.isDummy ? 1 : -1;
+      }
+      return aScore - bScore || a.origX - b.origX;
+    });
+    items.forEach((item, idx) => orderInLayer.set(item.id, idx));
+  }
+
+  // 5. Assign X coordinates across layers (including dummy corridors!)
+  const H_GAP = 265;
+  const V_START = 95;
+  const V_GAP = 190;
+  const BASE_CENTER_X = 640;
+
+  // Build primary spanning tree on the augmented graph (real + dummy nodes)
+  const treeChildren = new Map<string, string[]>();
+  for (const item of itemsById.values()) {
+    treeChildren.set(item.id, []);
+  }
+
+  for (let l = 1; l <= maxLayer; l++) {
+    for (const item of layerItems[l]!) {
+      const incoming = [...(segmentsIn.get(item.id) ?? [])].sort(
+        (a, b) =>
+          (orderInLayer.get(a.fromId) ?? 0) - (orderInLayer.get(b.fromId) ?? 0) ||
+          a.slot - b.slot
+      );
+      if (incoming[0]) {
+        treeChildren.get(incoming[0].fromId)?.push(item.id);
+      }
+    }
+  }
+
+  const subtreeWidth = new Map<string, number>();
+  function calcWidth(id: string): number {
+    const ch = treeChildren.get(id) ?? [];
+    if (ch.length === 0) {
+      subtreeWidth.set(id, H_GAP);
+      return H_GAP;
+    }
+    const sum = ch.reduce((acc, cid) => acc + calcWidth(cid), 0);
+    const w = Math.max(H_GAP, sum);
+    subtreeWidth.set(id, w);
+    return w;
+  }
+
+  for (const r of layerItems[0]!) {
+    calcWidth(r.id);
+  }
+  for (const item of itemsById.values()) {
+    if (!subtreeWidth.has(item.id)) {
+      calcWidth(item.id);
+    }
+  }
+
+  const posX = new Map<string, number>();
+  function placeTree(id: string, centerX: number) {
+    posX.set(id, centerX);
+    const ch = treeChildren.get(id) ?? [];
+    if (ch.length === 0) return;
+    const totalW = ch.reduce((acc, cid) => acc + (subtreeWidth.get(cid) ?? H_GAP), 0);
+    let cursor = centerX - totalW / 2;
+    for (const cid of ch) {
+      const w = subtreeWidth.get(cid) ?? H_GAP;
+      placeTree(cid, cursor + w / 2);
+      cursor += w;
+    }
+  }
+
+  const totalRootsW = layerItems[0]!.reduce(
+    (acc, r) => acc + (subtreeWidth.get(r.id) ?? H_GAP),
+    0
+  );
+  const startCenterX = Math.max(CHAPTER_HEADER_WIDTH + 160 + totalRootsW / 2, BASE_CENTER_X);
+  let rootCursor = startCenterX - totalRootsW / 2;
+  for (const r of layerItems[0]!) {
+    const w = subtreeWidth.get(r.id) ?? H_GAP;
+    placeTree(r.id, rootCursor + w / 2);
+    rootCursor += w;
+  }
+
+  // Refine merge nodes (multiple parents) & enforce non-overlapping spacing per layer
+  for (let l = 1; l <= maxLayer; l++) {
+    const items = layerItems[l]!;
+    for (const item of items) {
+      const incoming = segmentsIn.get(item.id) ?? [];
+      if (incoming.length >= 2) {
+        const avgParentX =
+          incoming.reduce((sum, s) => sum + (posX.get(s.fromId) ?? startCenterX), 0) /
+          incoming.length;
+        posX.set(item.id, avgParentX);
+      }
+    }
+
+    // Re-sort by desired X and enforce H_GAP between all items (including dummy nodes!)
+    items.sort((a, b) => (posX.get(a.id) ?? 0) - (posX.get(b.id) ?? 0));
+    if (items.length > 1) {
+      const groupCenter =
+        items.reduce((sum, item) => sum + (posX.get(item.id) ?? startCenterX), 0) /
+        items.length;
+      for (let i = 1; i < items.length; i++) {
+        const prevId = items[i - 1]!.id;
+        const currId = items[i]!.id;
+        const prevVal = posX.get(prevId) ?? startCenterX;
+        const currVal = posX.get(currId) ?? startCenterX;
+        if (currVal - prevVal < H_GAP) {
+          posX.set(currId, prevVal + H_GAP);
+        }
+      }
+      // Re-center the layer around its original groupCenter
+      const newCenter =
+        items.reduce((sum, item) => sum + (posX.get(item.id) ?? startCenterX), 0) /
+        items.length;
+      const delta = groupCenter - newCenter;
+      for (const item of items) {
+        posX.set(item.id, (posX.get(item.id) ?? startCenterX) + delta);
+      }
+    }
+  }
+
+  // 6. Explicit Line-vs-Node Clearance Check for any long edge (u -> v where layer(v) - layer(u) > 1)
+  const tempNodeById = new Map<string, FlowNode>();
+  for (const n of prev.nodes) {
+    const l = layerMap.get(n.id) ?? 0;
+    tempNodeById.set(n.id, {
+      ...n,
+      x: Math.round(posX.get(n.id) ?? n.x),
+      y: Math.round(V_START + l * V_GAP),
+    });
+  }
+
+  const MIN_LINE_CLEARANCE = 175;
+  for (const e of validEdges) {
+    const u = tempNodeById.get(e.sourceId);
+    const v = tempNodeById.get(e.targetId);
+    if (!u || !v) continue;
+    const uLayer = layerMap.get(u.id) ?? 0;
+    const vLayer = layerMap.get(v.id) ?? 0;
+    if (vLayer - uLayer <= 1) continue;
+
+    const startPos = getSlotPlusPosition(u, e.sourceSlot);
+    const sx = startPos.x;
+    const sy = startPos.y + PLUS_RADIUS;
+    const endPos = getNodeTopPoint(v);
+    const tx = endPos.x;
+    const ty = endPos.y;
+
+    for (let l = uLayer + 1; l < vLayer; l++) {
+      const realItemsInLayer = layerItems[l]!.filter((it) => !it.isDummy);
+      for (const it of realItemsInLayer) {
+        const w = tempNodeById.get(it.id);
+        if (!w) continue;
+        const ratio = (w.y - sy) / (ty - sy || 1);
+        const lineX = sx + (tx - sx) * ratio;
+        const diff = w.x - lineX;
+        if (Math.abs(diff) < MIN_LINE_CLEARANCE) {
+          const pushDir = diff < 0 ? -1 : e.sourceSlot > 0 ? -1 : 1;
+          w.x = Math.round(lineX + pushDir * MIN_LINE_CLEARANCE);
+        }
+      }
+    }
+  }
+
+  // Ensure all real nodes sit to the right of the chapter sidebar
+  const minX = Math.min(...Array.from(tempNodeById.values()).map((n) => n.x));
+  const minAllowedX = CHAPTER_HEADER_WIDTH + 150;
+  const shiftRight = minX < minAllowedX ? minAllowedX - minX : 0;
+
+  const updatedNodes = prev.nodes.map((n) => {
+    const placed = tempNodeById.get(n.id)!;
+    return {
+      ...n,
+      x: Math.round(placed.x + shiftRight),
+      y: placed.y,
+    };
+  });
+
+  const maxRequiredY = V_START + maxLayer * V_GAP + 150;
+  const currentChaptersH = prev.chapters.reduce((sum, c) => sum + c.height, 0);
+  let updatedChapters = prev.chapters;
+  if (maxRequiredY > currentChaptersH && prev.chapters.length > 0) {
+    const extra = maxRequiredY - currentChaptersH;
+    updatedChapters = prev.chapters.map((c, idx) =>
+      idx === prev.chapters.length - 1 ? { ...c, height: c.height + extra } : c
+    );
+  }
+
+  return {
+    ...prev,
+    chapters: updatedChapters,
+    nodes: updatedNodes,
+  };
+}
+
 export function App() {
   const [chart, setChart] = useState<FlowchartData>(() => {
     try {
@@ -247,11 +682,6 @@ export function App() {
     [selectedNodeId, nodeMap]
   );
 
-  const selectedEdge = useMemo(
-    () => (selectedEdgeId ? chart.edges.find((e) => e.id === selectedEdgeId) ?? null : null),
-    [selectedEdgeId, chart.edges]
-  );
-
   // Determine which chapter lane a given Y coordinate falls into
   function getChapterForY(y: number) {
     for (const ch of chapterRanges) {
@@ -336,7 +766,7 @@ export function App() {
     };
   }, [draggingNode, resizingChapter, zoom]);
 
-  // Check branch connection state of a node (used for diamond red state & rect multi-branch status)
+  // Check branch connection state of a node
   function getNodeBranchState(node: FlowNode) {
     const branchCount = getNodeSlotCount(node);
     const connectedSlots = new Set<number>();
@@ -360,253 +790,9 @@ export function App() {
     };
   }
 
-  // Automatic hierarchical layout (自動ソート・整列)
+  // Trigger automatic hierarchical layout
   function handleAutoSort() {
-    setChart((prev) => {
-      if (prev.nodes.length === 0) return prev;
-
-      const validIds = new Set(prev.nodes.map((n) => n.id));
-      const validEdges = prev.edges.filter(
-        (e) => validIds.has(e.sourceId) && validIds.has(e.targetId) && e.sourceId !== e.targetId
-      );
-
-      const inDegree = new Map<string, number>();
-      const outEdges = new Map<string, FlowEdge[]>();
-      const inEdges = new Map<string, FlowEdge[]>();
-
-      for (const n of prev.nodes) {
-        inDegree.set(n.id, 0);
-        outEdges.set(n.id, []);
-        inEdges.set(n.id, []);
-      }
-
-      for (const e of validEdges) {
-        inDegree.set(e.targetId, (inDegree.get(e.targetId) ?? 0) + 1);
-        outEdges.get(e.sourceId)?.push(e);
-        inEdges.get(e.targetId)?.push(e);
-      }
-
-      for (const list of outEdges.values()) {
-        list.sort((a, b) => a.sourceSlot - b.sourceSlot);
-      }
-
-      // Find roots (inDegree === 0), fallback to topmost node if cycle
-      let roots = prev.nodes
-        .filter((n) => (inDegree.get(n.id) ?? 0) === 0)
-        .sort((a, b) => a.y - b.y || a.x - b.x);
-
-      if (roots.length === 0) {
-        const sortedByY = [...prev.nodes].sort((a, b) => a.y - b.y || a.x - b.x);
-        roots = [sortedByY[0]!];
-      }
-
-      // Assign hierarchical layer (depth) via BFS / longest path without cycles
-      const layerMap = new Map<string, number>();
-      const queue: Array<{ id: string; depth: number; path: Set<string> }> = [];
-
-      for (const r of roots) {
-        layerMap.set(r.id, 0);
-        queue.push({ id: r.id, depth: 0, path: new Set([r.id]) });
-      }
-
-      while (queue.length > 0) {
-        const curr = queue.shift()!;
-        const edgesFromCurr = outEdges.get(curr.id) ?? [];
-        for (const edge of edgesFromCurr) {
-          if (curr.path.has(edge.targetId)) continue; // avoid cycle infinite loop
-          const nextDepth = curr.depth + 1;
-          const prevDepth = layerMap.get(edge.targetId) ?? -1;
-          if (nextDepth > prevDepth) {
-            layerMap.set(edge.targetId, nextDepth);
-            const nextPath = new Set(curr.path);
-            nextPath.add(edge.targetId);
-            queue.push({ id: edge.targetId, depth: nextDepth, path: nextPath });
-          }
-        }
-      }
-
-      // Any disconnected cycle components not reached yet
-      for (const n of prev.nodes) {
-        if (!layerMap.has(n.id)) {
-          layerMap.set(n.id, 0);
-        }
-      }
-
-      // Group nodes by layer
-      const maxLayer = Math.max(0, ...Array.from(layerMap.values()));
-      const layers: FlowNode[][] = Array.from({ length: maxLayer + 1 }, () => []);
-      for (const n of prev.nodes) {
-        const l = layerMap.get(n.id) ?? 0;
-        layers[l]!.push(n);
-      }
-
-      // Order nodes within each layer to minimize edge crossings & respect sourceSlot order
-      const nodeOrderInLayer = new Map<string, number>();
-      layers[0]!.sort((a, b) => a.x - b.x);
-      layers[0]!.forEach((n, idx) => nodeOrderInLayer.set(n.id, idx));
-
-      for (let l = 1; l <= maxLayer; l++) {
-        const layerNodes = layers[l]!;
-        layerNodes.sort((a, b) => {
-          const aParents = (inEdges.get(a.id) ?? []).filter(
-            (e) => (layerMap.get(e.sourceId) ?? 0) < l
-          );
-          const bParents = (inEdges.get(b.id) ?? []).filter(
-            (e) => (layerMap.get(e.sourceId) ?? 0) < l
-          );
-
-          const aScore =
-            aParents.length > 0
-              ? aParents.reduce(
-                  (sum, e) =>
-                    sum + (nodeOrderInLayer.get(e.sourceId) ?? 0) * 100 + e.sourceSlot,
-                  0
-                ) / aParents.length
-              : a.x;
-          const bScore =
-            bParents.length > 0
-              ? bParents.reduce(
-                  (sum, e) =>
-                    sum + (nodeOrderInLayer.get(e.sourceId) ?? 0) * 100 + e.sourceSlot,
-                  0
-                ) / bParents.length
-              : b.x;
-
-          return aScore - bScore || a.x - b.x;
-        });
-        layerNodes.forEach((n, idx) => nodeOrderInLayer.set(n.id, idx));
-      }
-
-      // Compute primary tree children for subtree width calculation
-      const primaryChildren = new Map<string, string[]>();
-      for (const n of prev.nodes) {
-        primaryChildren.set(n.id, []);
-      }
-      for (let l = 1; l <= maxLayer; l++) {
-        for (const n of layers[l]!) {
-          const parents = (inEdges.get(n.id) ?? [])
-            .filter((e) => (layerMap.get(e.sourceId) ?? 0) < l)
-            .sort(
-              (a, b) =>
-                (layerMap.get(b.sourceId) ?? 0) - (layerMap.get(a.sourceId) ?? 0) ||
-                a.sourceSlot - b.sourceSlot
-            );
-          if (parents[0]) {
-            primaryChildren.get(parents[0].sourceId)?.push(n.id);
-          }
-        }
-      }
-
-      const H_GAP = 255;
-      const V_START = 95;
-      const V_GAP = 190;
-
-      const subtreeWidth = new Map<string, number>();
-      function calcWidth(id: string): number {
-        const ch = primaryChildren.get(id) ?? [];
-        if (ch.length === 0) {
-          subtreeWidth.set(id, H_GAP);
-          return H_GAP;
-        }
-        const sum = ch.reduce((acc, cid) => acc + calcWidth(cid), 0);
-        const w = Math.max(H_GAP, sum);
-        subtreeWidth.set(id, w);
-        return w;
-      }
-
-      for (const r of layers[0]!) {
-        calcWidth(r.id);
-      }
-      for (const n of prev.nodes) {
-        if (!subtreeWidth.has(n.id)) {
-          calcWidth(n.id);
-        }
-      }
-
-      const newX = new Map<string, number>();
-      function placeSubtree(id: string, centerX: number) {
-        newX.set(id, centerX);
-        const ch = primaryChildren.get(id) ?? [];
-        if (ch.length === 0) return;
-        const totalW = ch.reduce((acc, cid) => acc + (subtreeWidth.get(cid) ?? H_GAP), 0);
-        let cursor = centerX - totalW / 2;
-        for (const cid of ch) {
-          const w = subtreeWidth.get(cid) ?? H_GAP;
-          placeSubtree(cid, cursor + w / 2);
-          cursor += w;
-        }
-      }
-
-      // Place roots horizontally
-      const totalRootsWidth = layers[0]!.reduce(
-        (acc, r) => acc + (subtreeWidth.get(r.id) ?? H_GAP),
-        0
-      );
-      const baseCenterX = Math.max(
-        CHAPTER_HEADER_WIDTH + 160 + totalRootsWidth / 2,
-        640
-      );
-      let rootCursor = baseCenterX - totalRootsWidth / 2;
-      for (const r of layers[0]!) {
-        const w = subtreeWidth.get(r.id) ?? H_GAP;
-        placeSubtree(r.id, rootCursor + w / 2);
-        rootCursor += w;
-      }
-
-      // Resolve any remaining nodes or horizontal overlaps per layer
-      for (let l = 0; l <= maxLayer; l++) {
-        const layerNodes = layers[l]!;
-        for (let i = 0; i < layerNodes.length; i++) {
-          const n = layerNodes[i]!;
-          if (!newX.has(n.id)) {
-            newX.set(n.id, baseCenterX + (i - (layerNodes.length - 1) / 2) * H_GAP);
-          }
-        }
-        // Ensure minimum X and non-overlapping spacing
-        for (let i = 0; i < layerNodes.length; i++) {
-          const n = layerNodes[i]!;
-          let xVal = newX.get(n.id) ?? baseCenterX;
-          if (i === 0) {
-            xVal = Math.max(CHAPTER_HEADER_WIDTH + 145, xVal);
-          } else {
-            const prevNode = layerNodes[i - 1]!;
-            const prevX = newX.get(prevNode.id) ?? CHAPTER_HEADER_WIDTH + 145;
-            xVal = Math.max(xVal, prevX + H_GAP);
-          }
-          newX.set(n.id, Math.round(xVal));
-        }
-      }
-
-      // If leftmost node was pushed right, shift entire chart so minimum X is comfortable
-      const minPlacedX = Math.min(...Array.from(newX.values()));
-      const minAllowedX = CHAPTER_HEADER_WIDTH + 150;
-      const shiftX = minPlacedX < minAllowedX ? minAllowedX - minPlacedX : 0;
-
-      const updatedNodes = prev.nodes.map((n) => {
-        const l = layerMap.get(n.id) ?? 0;
-        return {
-          ...n,
-          x: Math.round((newX.get(n.id) ?? n.x) + shiftX),
-          y: Math.round(V_START + l * V_GAP),
-        };
-      });
-
-      const maxRequiredY = V_START + maxLayer * V_GAP + 150;
-      const currentChaptersH = prev.chapters.reduce((sum, c) => sum + c.height, 0);
-      let updatedChapters = prev.chapters;
-      if (maxRequiredY > currentChaptersH && prev.chapters.length > 0) {
-        const extra = maxRequiredY - currentChaptersH;
-        updatedChapters = prev.chapters.map((c, idx) =>
-          idx === prev.chapters.length - 1 ? { ...c, height: c.height + extra } : c
-        );
-      }
-
-      return {
-        ...prev,
-        chapters: updatedChapters,
-        nodes: updatedNodes,
-      };
-    });
+    setChart((prev) => sortFlowchartLayout(prev));
   }
 
   // Create a new child node (rect or diamond) from a source node's slot
@@ -1234,23 +1420,12 @@ export function App() {
                     if (!sourceNode || !targetNode) return null;
                     if (sourceNode.type === "rect" && sourceNode.isEnd) return null;
 
-                    const startPos = getSlotPlusPosition(sourceNode, edge.sourceSlot);
-                    const sx = startPos.x;
-                    const sy = startPos.y + PLUS_RADIUS;
-                    const endPos = getNodeTopPoint(targetNode);
-                    const tx = endPos.x;
-                    const ty = endPos.y;
-
-                    const dy = ty - sy;
-                    const controlOffset = Math.max(45, Math.abs(dy) * 0.45);
-                    const pathD =
-                      dy >= 10
-                        ? `M ${sx} ${sy} C ${sx} ${sy + controlOffset}, ${tx} ${
-                            ty - controlOffset
-                          }, ${tx} ${ty}`
-                        : `M ${sx} ${sy} C ${sx} ${sy + 70}, ${tx} ${
-                            ty - 70
-                          }, ${tx} ${ty}`;
+                    const { pathD } = computeEdgeGeometry(
+                      edge,
+                      sourceNode,
+                      targetNode,
+                      chart.nodes
+                    );
 
                     const isSelected = selectedEdgeId === edge.id;
 
@@ -1293,15 +1468,12 @@ export function App() {
                   if (!sourceNode || !targetNode) return null;
                   if (sourceNode.type === "rect" && sourceNode.isEnd) return null;
 
-                  const startPos = getSlotPlusPosition(sourceNode, edge.sourceSlot);
-                  const sx = startPos.x;
-                  const sy = startPos.y + PLUS_RADIUS;
-                  const endPos = getNodeTopPoint(targetNode);
-                  const tx = endPos.x;
-                  const ty = endPos.y;
-
-                  const midX = (sx + tx) / 2;
-                  const midY = (sy + ty) / 2;
+                  const { midX, midY } = computeEdgeGeometry(
+                    edge,
+                    sourceNode,
+                    targetNode,
+                    chart.nodes
+                  );
                   const hasLabel = Boolean(edge.label && edge.label.trim().length > 0);
                   const isSelected = selectedEdgeId === edge.id;
 

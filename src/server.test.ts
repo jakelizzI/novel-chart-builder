@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { sortFlowchartLayout } from "./App";
 import { deleteProject, getFlowchart, listProjects, saveFlowchart } from "./db";
 import { createMinimalFlowchart } from "./defaultData";
+import type { FlowchartData } from "./types";
 
-describe("SQLite Flowchart Persistence", () => {
+describe("SQLite Flowchart Persistence & Auto-Sort Layout", () => {
   test("creates and retrieves a flowchart with rect/diamond branches and edge comments", () => {
     const testId = "test-proj-1";
     const chart = createMinimalFlowchart(testId, "テスト企画");
 
-    // Set rectangle to have 2 branches
     chart.nodes[0]!.branchCount = 2;
 
     chart.nodes.push({
@@ -51,8 +52,38 @@ describe("SQLite Flowchart Persistence", () => {
     const projects = listProjects();
     expect(projects.some((p) => p.id === testId)).toBe(true);
 
-    // Clean up test project
     const deleted = deleteProject(testId);
     expect(deleted).toBe(true);
+  });
+
+  test("sortFlowchartLayout prevents skip-level edge (導入 -> 3節) from hiding behind 2節 (導入 -> 2節 -> 3節)", () => {
+    const chart: FlowchartData = {
+      id: "test-sort",
+      name: "スキップ接続テスト",
+      chapters: [{ id: "c1", title: "第1章", height: 600, order: 0 }],
+      nodes: [
+        { id: "n1", type: "rect", title: "導入", content: "", x: 520, y: 100, branchCount: 2 },
+        { id: "n2", type: "rect", title: "2節", content: "", x: 520, y: 280, branchCount: 1 },
+        { id: "n3", type: "rect", title: "3節", content: "", x: 520, y: 460, branchCount: 1 },
+      ],
+      edges: [
+        { id: "e1", sourceId: "n1", sourceSlot: 0, targetId: "n2" },
+        { id: "e2", sourceId: "n2", sourceSlot: 0, targetId: "n3" },
+        { id: "e3", sourceId: "n1", sourceSlot: 1, targetId: "n3" },
+      ],
+    };
+
+    const sorted = sortFlowchartLayout(chart);
+    const n1 = sorted.nodes.find((n) => n.id === "n1")!;
+    const n2 = sorted.nodes.find((n) => n.id === "n2")!;
+    const n3 = sorted.nodes.find((n) => n.id === "n3")!;
+
+    // Hierarchical Y ordering: 導入 < 2節 < 3節
+    expect(n1.y).toBeLessThan(n2.y);
+    expect(n2.y).toBeLessThan(n3.y);
+
+    // Line from n1 to n3 at y = n2.y must not pass through n2's box (half-width 105px)
+    const lineXAtN2 = n1.x + (n3.x - n1.x) * ((n2.y - n1.y) / (n3.y - n1.y));
+    expect(Math.abs(n2.x - lineXAtN2)).toBeGreaterThanOrEqual(150);
   });
 });
