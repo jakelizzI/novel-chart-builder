@@ -76,6 +76,59 @@ export function deleteNodesFromChart(
   };
 }
 
+/**
+ * Moves one or multiple nodes by (rawDx, rawDy) while strictly preserving
+ * their relative positions even when hitting the left/top canvas bounds.
+ */
+export function moveNodesInChart(
+  chart: FlowchartData,
+  origPositions: ReadonlyMap<string, { x: number; y: number }>,
+  rawDx: number,
+  rawDy: number
+): FlowchartData {
+  if (origPositions.size === 0) return chart;
+
+  let minOrigX = Infinity;
+  let minOrigY = Infinity;
+  for (const pos of origPositions.values()) {
+    if (pos.x < minOrigX) minOrigX = pos.x;
+    if (pos.y < minOrigY) minOrigY = pos.y;
+  }
+
+  const minAllowedX = CHAPTER_HEADER_WIDTH + 120;
+  const minAllowedY = 55;
+
+  // Clamp group delta as a single vector so relative offsets between selected nodes never distort
+  const clampedDx = Math.round(Math.max(minAllowedX - minOrigX, rawDx));
+  const clampedDy = Math.round(Math.max(minAllowedY - minOrigY, rawDy));
+
+  let maxMovedY = 0;
+  const nextNodes = chart.nodes.map((n) => {
+    const orig = origPositions.get(n.id);
+    if (!orig) return n;
+    const nextX = orig.x + clampedDx;
+    const nextY = orig.y + clampedDy;
+    if (nextY > maxMovedY) maxMovedY = nextY;
+    return { ...n, x: nextX, y: nextY };
+  });
+
+  // Expand bottom chapter lane if moved nodes extend past current total chapter height
+  const totalH = chart.chapters.reduce((sum, c) => sum + c.height, 0);
+  let updatedChapters = chart.chapters;
+  if (maxMovedY + 120 > totalH && chart.chapters.length > 0) {
+    const extra = maxMovedY + 120 - totalH;
+    updatedChapters = chart.chapters.map((c, idx) =>
+      idx === chart.chapters.length - 1 ? { ...c, height: c.height + extra } : c
+    );
+  }
+
+  return {
+    ...chart,
+    chapters: updatedChapters,
+    nodes: nextNodes,
+  };
+}
+
 function getNodeSlotCount(node: FlowNode): number {
   if (node.type === "rect") {
     if (node.isEnd) return 0;
@@ -553,13 +606,14 @@ export function App() {
   const [redoStack, setRedoStack] = useState<FlowchartData[]>([]);
   const [undoToast, setUndoToast] = useState<{ message: string; id: number } | null>(null);
 
-  // Dragging node state
-  const [draggingNode, setDraggingNode] = useState<{
-    nodeId: string;
+  // Dragging node(s) state (supports single node OR multi-selected group while keeping relative layout)
+  const [draggingNodes, setDraggingNodes] = useState<{
+    clickedNodeId: string;
+    wasAlreadyMultiSelected: boolean;
     startX: number;
     startY: number;
-    origX: number;
-    origY: number;
+    origPositions: Map<string, { x: number; y: number }>;
+    snapshotBeforeDrag: FlowchartData;
     hasMoved: boolean;
   } | null>(null);
 
@@ -570,14 +624,19 @@ export function App() {
     origHeight: number;
     chapterBottomYAtStart: number;
     shiftNodesBelow: boolean;
+    snapshotBeforeResize: FlowchartData;
+    hasResized: boolean;
   } | null>(null);
+
+  // Ref to track whether the last mousedown->mouseup gesture actually dragged nodes
+  const suppressClickAfterDragRef = useRef(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
   const flowchartCanvasRef = useRef<HTMLDivElement | null>(null);
   const initialLoadDone = useRef(false);
 
-  // Helper to push a snapshot onto undoStack before destructive/structural changes
+  // Helper to push a snapshot onto undoStack before destructive/structural/move changes
   function pushUndoSnapshot(snapshot: FlowchartData) {
     setUndoStack((prev) => {
       const next = [...prev, cloneFlowchart(snapshot)];
@@ -834,44 +893,78 @@ export function App() {
     return chapterRanges[chapterRanges.length - 1] ?? null;
   }
 
-  // Handle mouse move / up for node dragging, chapter resizing, and marquee selection
+  // Start dragging a single node OR the entire selected group if the clicked node is part of the selection
+  function handleNodeMouseDown(e: React.MouseEvent, node: FlowNode) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+
+    if (mergeMode) {
+      if (mergeMode.sourceId !== node.id) {
+        handleConnectToExistingNode(mergeMode.sourceId, mergeMode.sourceSlot, node.id);
+      }
+      return;
+    }
+
+    if (e.ctrlKey || e.metaKey) {
+      return;
+    }
+
+    const isPartOfSelection = selectedNodeSet.has(node.id);
+    const movingIds =
+      isPartOfSelection && selectedNodeIds.length >= 2 ? selectedNodeIds : [node.id];
+
+    const origPositions = new Map<string, { x: number; y: number }>();
+    for (const id of movingIds) {
+      const target = nodeMap.get(id);
+      if (target) {
+        origPositions.set(id, { x: target.x, y: target.y });
+      }
+    }
+
+    suppressClickAfterDragRef.current = false;
+    setDraggingNodes({
+      clickedNodeId: node.id,
+      wasAlreadyMultiSelected: isPartOfSelection && selectedNodeIds.length >= 2,
+      startX: e.clientX,
+      startY: e.clientY,
+      origPositions,
+      snapshotBeforeDrag: cloneFlowchart(chart),
+      hasMoved: false,
+    });
+  }
+
+  // Handle mouse move / up for node(s) dragging, chapter resizing, and marquee selection
   useEffect(() => {
-    if (!draggingNode && !resizingChapter && !marquee) return;
+    if (!draggingNodes && !resizingChapter && !marquee) return;
 
     function onMouseMove(e: MouseEvent) {
-      if (draggingNode) {
-        const dx = (e.clientX - draggingNode.startX) / zoom;
-        const dy = (e.clientY - draggingNode.startY) / zoom;
-        const moved = draggingNode.hasMoved || Math.abs(dx) > 3 || Math.abs(dy) > 3;
-        if (moved && !draggingNode.hasMoved) {
-          setDraggingNode((prev) => (prev ? { ...prev, hasMoved: true } : null));
-        }
-        const nextX = Math.max(CHAPTER_HEADER_WIDTH + 120, Math.round(draggingNode.origX + dx));
-        const nextY = Math.max(55, Math.round(draggingNode.origY + dy));
+      if (draggingNodes) {
+        const rawDx = (e.clientX - draggingNodes.startX) / zoom;
+        const rawDy = (e.clientY - draggingNodes.startY) / zoom;
+        const moved = draggingNodes.hasMoved || Math.abs(rawDx) > 3 || Math.abs(rawDy) > 3;
 
-        setChart((prev) => {
-          const totalH = prev.chapters.reduce((sum, c) => sum + c.height, 0);
-          let updatedChapters = prev.chapters;
-          if (nextY + 120 > totalH && prev.chapters.length > 0) {
-            const extra = nextY + 120 - totalH;
-            updatedChapters = prev.chapters.map((c, idx) =>
-              idx === prev.chapters.length - 1 ? { ...c, height: c.height + extra } : c
-            );
-          }
-          return {
-            ...prev,
-            chapters: updatedChapters,
-            nodes: prev.nodes.map((n) =>
-              n.id === draggingNode.nodeId ? { ...n, x: nextX, y: nextY } : n
-            ),
-          };
-        });
+        if (moved && !draggingNodes.hasMoved) {
+          suppressClickAfterDragRef.current = true;
+          pushUndoSnapshot(draggingNodes.snapshotBeforeDrag);
+          setDraggingNodes((prev) => (prev ? { ...prev, hasMoved: true } : null));
+        }
+
+        if (moved) {
+          setChart((prev) =>
+            moveNodesInChart(prev, draggingNodes.origPositions, rawDx, rawDy)
+          );
+        }
       }
 
       if (resizingChapter) {
         const dy = (e.clientY - resizingChapter.startY) / zoom;
         const newHeight = Math.max(160, Math.round(resizingChapter.origHeight + dy));
         const actualDiff = newHeight - resizingChapter.origHeight;
+
+        if (Math.abs(actualDiff) > 2 && !resizingChapter.hasResized) {
+          pushUndoSnapshot(resizingChapter.snapshotBeforeResize);
+          setResizingChapter((prev) => (prev ? { ...prev, hasResized: true } : null));
+        }
 
         setChart((prev) => {
           const prevChapter = prev.chapters.find((c) => c.id === resizingChapter.chapterId);
@@ -943,7 +1036,7 @@ export function App() {
       if (marquee && !marquee.hasDragged && !marquee.additive) {
         setSelectedNodeIds([]);
       }
-      setDraggingNode(null);
+      setDraggingNodes(null);
       setResizingChapter(null);
       setMarquee(null);
     }
@@ -954,7 +1047,7 @@ export function App() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [draggingNode, resizingChapter, marquee, zoom, chart.nodes]);
+  }, [draggingNodes, resizingChapter, marquee, zoom, chart.nodes]);
 
   // Check branch connection state of a node
   function getNodeBranchState(node: FlowNode) {
@@ -1294,6 +1387,16 @@ export function App() {
   function handleNodeClick(e: React.MouseEvent, nodeId: string) {
     e.stopPropagation();
     if (mergeMode) return;
+
+    // If the user just finished dragging a node or group, keep the selection intact!
+    if (suppressClickAfterDragRef.current) {
+      suppressClickAfterDragRef.current = false;
+      if (!selectedNodeSet.has(nodeId)) {
+        setSelectedNodeIds([nodeId]);
+      }
+      return;
+    }
+
     setSelectedEdgeId(null);
     setPlusMenu(null);
 
@@ -1360,7 +1463,7 @@ export function App() {
             className="btn btn-secondary"
             onClick={handleUndo}
             disabled={undoStack.length === 0}
-            title="直前の削除や変更を元に戻す (Ctrl + Z)"
+            title="直前の削除・移動・変更を元に戻す (Ctrl + Z)"
           >
             ↩ 元に戻す
           </button>
@@ -1426,7 +1529,7 @@ export function App() {
           <div className="multi-select-info">
             <span className="multi-count-badge">{selectedNodeIds.length} 個の図形を選択中</span>
             <span className="multi-select-hint">
-              （Ctrl + クリックで1つずつ選択解除 ／ Deleteキーでも一括削除可能）
+              （選択した図形をドラッグしてまとめて移動 ／ Ctrl + クリックで個別解除 ／ Deleteで一括削除）
             </span>
           </div>
           <div className="multi-select-actions">
@@ -1575,6 +1678,8 @@ export function App() {
                           origHeight: ch.height,
                           chapterBottomYAtStart: ch.bottom,
                           shiftNodesBelow: !e.altKey,
+                          snapshotBeforeResize: cloneFlowchart(chart),
+                          hasResized: false,
                         });
                       }}
                       title="上下にドラッグして章エリアの高さを変更（Altキーを押しながらで下部ノード位置を固定）"
@@ -1867,31 +1972,7 @@ export function App() {
                             width: `${RECT_WIDTH}px`,
                             height: `${RECT_HEIGHT}px`,
                           }}
-                          onMouseDown={(e) => {
-                            if (e.button !== 0) return;
-                            e.stopPropagation();
-                            if (mergeMode) {
-                              if (mergeMode.sourceId !== node.id) {
-                                handleConnectToExistingNode(
-                                  mergeMode.sourceId,
-                                  mergeMode.sourceSlot,
-                                  node.id
-                                );
-                              }
-                              return;
-                            }
-                            if (e.ctrlKey || e.metaKey) {
-                              return;
-                            }
-                            setDraggingNode({
-                              nodeId: node.id,
-                              startX: e.clientX,
-                              startY: e.clientY,
-                              origX: node.x,
-                              origY: node.y,
-                              hasMoved: false,
-                            });
-                          }}
+                          onMouseDown={(e) => handleNodeMouseDown(e, node)}
                           onClick={(e) => handleNodeClick(e, node.id)}
                         >
                           <div className="rect-node-header">
@@ -1925,31 +2006,7 @@ export function App() {
                             width: `${DIAMOND_WIDTH}px`,
                             height: `${DIAMOND_HEIGHT}px`,
                           }}
-                          onMouseDown={(e) => {
-                            if (e.button !== 0) return;
-                            e.stopPropagation();
-                            if (mergeMode) {
-                              if (mergeMode.sourceId !== node.id) {
-                                handleConnectToExistingNode(
-                                  mergeMode.sourceId,
-                                  mergeMode.sourceSlot,
-                                  node.id
-                                );
-                              }
-                              return;
-                            }
-                            if (e.ctrlKey || e.metaKey) {
-                              return;
-                            }
-                            setDraggingNode({
-                              nodeId: node.id,
-                              startX: e.clientX,
-                              startY: e.clientY,
-                              origX: node.x,
-                              origY: node.y,
-                              hasMoved: false,
-                            });
-                          }}
+                          onMouseDown={(e) => handleNodeMouseDown(e, node)}
                           onClick={(e) => handleNodeClick(e, node.id)}
                         >
                           <svg

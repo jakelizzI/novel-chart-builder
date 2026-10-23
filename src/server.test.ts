@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { cloneFlowchart, deleteNodesFromChart, sortFlowchartLayout } from "./App";
+import {
+  cloneFlowchart,
+  deleteNodesFromChart,
+  moveNodesInChart,
+  sortFlowchartLayout,
+} from "./App";
 import { deleteProject, getFlowchart, listProjects, saveFlowchart } from "./db";
 import { createInitialFlowchart, createMinimalFlowchart } from "./defaultData";
 import type { FlowchartData } from "./types";
@@ -89,12 +94,10 @@ describe("SQLite Flowchart Persistence & Auto-Sort Layout", () => {
     const original = createInitialFlowchart("test-bulk", "一括削除テスト");
     const snapshot = cloneFlowchart(original);
 
-    // Bulk delete node-3 and node-5
     const afterDelete = deleteNodesFromChart(original, ["node-3", "node-5"]);
     expect(afterDelete.nodes.length).toBe(original.nodes.length - 2);
     expect(afterDelete.nodes.some((n) => n.id === "node-3")).toBe(false);
     expect(afterDelete.nodes.some((n) => n.id === "node-5")).toBe(false);
-    // Incident edges to node-3 or node-5 are also removed
     expect(
       afterDelete.edges.some(
         (e) =>
@@ -105,9 +108,37 @@ describe("SQLite Flowchart Persistence & Auto-Sort Layout", () => {
       )
     ).toBe(false);
 
-    // Undo snapshot remains completely intact with all nodes, edges, and labels
     expect(snapshot.nodes.length).toBe(6);
     expect(snapshot.edges.length).toBe(5);
     expect(snapshot.edges.find((e) => e.id === "edge-3")?.label).toBe("SAN値が80以下の場合");
+  });
+
+  test("moveNodesInChart moves multiple selected nodes together preserving relative distances even at boundaries", () => {
+    const original = createInitialFlowchart("test-move", "グループ移動テスト");
+    const n3Orig = original.nodes.find((n) => n.id === "node-3")!;
+    const n4Orig = original.nodes.find((n) => n.id === "node-4")!;
+    const origDeltaX = n4Orig.x - n3Orig.x;
+    const origDeltaY = n4Orig.y - n3Orig.y;
+
+    const origPositions = new Map<string, { x: number; y: number }>([
+      ["node-3", { x: n3Orig.x, y: n3Orig.y }],
+      ["node-4", { x: n4Orig.x, y: n4Orig.y }],
+    ]);
+
+    // Move right by 120px, down by 80px
+    const moved = moveNodesInChart(original, origPositions, 120, 80);
+    const n3Moved = moved.nodes.find((n) => n.id === "node-3")!;
+    const n4Moved = moved.nodes.find((n) => n.id === "node-4")!;
+    expect(n3Moved.x).toBe(n3Orig.x + 120);
+    expect(n3Moved.y).toBe(n3Orig.y + 80);
+    expect(n4Moved.x - n3Moved.x).toBe(origDeltaX);
+    expect(n4Moved.y - n3Moved.y).toBe(origDeltaY);
+
+    // Move far past top-left boundary (-2000, -2000) and verify relative distance is still preserved
+    const clamped = moveNodesInChart(original, origPositions, -2000, -2000);
+    const n3Clamped = clamped.nodes.find((n) => n.id === "node-3")!;
+    const n4Clamped = clamped.nodes.find((n) => n.id === "node-4")!;
+    expect(n4Clamped.x - n3Clamped.x).toBe(origDeltaX);
+    expect(n4Clamped.y - n3Clamped.y).toBe(origDeltaY);
   });
 });
