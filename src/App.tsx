@@ -19,6 +19,7 @@ const CHAPTER_HEADER_WIDTH = 240;
 const MIN_ZOOM = 0.3;
 const MAX_ZOOM = 2.0;
 const ZOOM_STEP = 0.1;
+const MAX_UNDO_HISTORY = 50;
 const LOCAL_STORAGE_KEY = "novel-chart-builder:current";
 
 interface ActivePlusMenu {
@@ -33,12 +34,46 @@ interface MergeModeState {
   sourceSlot: number;
 }
 
+interface MarqueeSelectionState {
+  startX: number;
+  startY: number;
+  currX: number;
+  currY: number;
+  additive: boolean;
+  initialSelectedIds: string[];
+  hasDragged: boolean;
+}
+
 function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
 function clampZoom(z: number): number {
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(z * 100) / 100));
+}
+
+export function cloneFlowchart(chart: FlowchartData): FlowchartData {
+  return {
+    ...chart,
+    chapters: chart.chapters.map((c) => ({ ...c })),
+    nodes: chart.nodes.map((n) => ({ ...n })),
+    edges: chart.edges.map((e) => ({ ...e })),
+  };
+}
+
+export function deleteNodesFromChart(
+  chart: FlowchartData,
+  nodeIdsToRemove: Iterable<string>
+): FlowchartData {
+  const removeSet = new Set(nodeIdsToRemove);
+  if (removeSet.size === 0) return chart;
+  return {
+    ...chart,
+    nodes: chart.nodes.filter((n) => !removeSet.has(n.id)),
+    edges: chart.edges.filter(
+      (e) => !removeSet.has(e.sourceId) && !removeSet.has(e.targetId)
+    ),
+  };
 }
 
 function getNodeSlotCount(node: FlowNode): number {
@@ -91,7 +126,6 @@ function computeEdgeGeometry(
   const minY = Math.min(sy, ty);
   const maxY = Math.max(sy, ty);
 
-  // Check if any intermediate node lies in the vertical range and close to the straight segment
   const obstacles = allNodes.filter((n) => {
     if (n.id === sourceNode.id || n.id === targetNode.id) return false;
     return n.y > minY + 15 && n.y < maxY - 15;
@@ -109,7 +143,6 @@ function computeEdgeGeometry(
     const clearance = (obs.type === "diamond" ? DIAMOND_WIDTH : RECT_WIDTH) / 2 + 45;
 
     if (Math.abs(dist) < clearance) {
-      // Determine direction to curve around the obstacle
       const dir =
         Math.abs(dist) > 4
           ? Math.sign(dist)
@@ -117,7 +150,6 @@ function computeEdgeGeometry(
           ? 1
           : -1;
       const desiredMidX = obs.x + dir * (clearance + 25);
-      // Cubic bezier at t=0.5 has X(0.5) = 0.125*(sx + tx) + 0.375*(cx1 + cx2)
       const controlX = (desiredMidX - 0.125 * (sx + tx)) / 0.75;
       cx1 = controlX;
       cx2 = controlX;
@@ -127,7 +159,6 @@ function computeEdgeGeometry(
   }
 
   const pathD = `M ${sx} ${sy} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${tx} ${ty}`;
-  // Exact point on the cubic Bezier curve at t = 0.5
   const midX = 0.125 * sx + 0.375 * cx1 + 0.375 * cx2 + 0.125 * tx;
   const midY = 0.125 * sy + 0.375 * cy1 + 0.375 * cy2 + 0.125 * ty;
 
@@ -163,7 +194,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
     list.sort((a, b) => a.sourceSlot - b.sourceSlot);
   }
 
-  // 1. Identify root nodes (inDegree === 0)
   let roots = prev.nodes
     .filter((n) => (inDegree.get(n.id) ?? 0) === 0)
     .sort((a, b) => a.y - b.y || a.x - b.x);
@@ -173,7 +203,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
     roots = [sortedByY[0]!];
   }
 
-  // 2. Longest-path layering (so a node is always strictly below all its ancestors)
   const layerMap = new Map<string, number>();
   const queue: Array<{ id: string; depth: number; path: Set<string> }> = [];
 
@@ -206,7 +235,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
 
   const maxLayer = Math.max(0, ...Array.from(layerMap.values()));
 
-  // 3. Build augmented layer graph with Dummy Nodes for edges spanning > 1 layer
   interface LayoutItem {
     id: string;
     isDummy: boolean;
@@ -238,7 +266,7 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
   for (const e of validEdges) {
     const uLayer = layerMap.get(e.sourceId) ?? 0;
     const vLayer = layerMap.get(e.targetId) ?? 0;
-    if (vLayer <= uLayer) continue; // ignore back/same-layer edges for hierarchy
+    if (vLayer <= uLayer) continue;
 
     if (vLayer - uLayer === 1) {
       const seg: LayoutSegment = {
@@ -249,7 +277,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
       segmentsOut.get(e.sourceId)?.push(seg);
       segmentsIn.get(e.targetId)?.push(seg);
     } else {
-      // Split long edge (e.g. 導入 -> ３節) into 1-layer segments with dummy nodes
       let prevId = e.sourceId;
       let prevSlot = e.sourceSlot;
       const uNode = itemsById.get(e.sourceId)!;
@@ -285,7 +312,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
     }
   }
 
-  // 4. Order items within each layer using barycenter + slot order
   const orderInLayer = new Map<string, number>();
   layerItems[0]!.sort((a, b) => a.origX - b.origX);
   layerItems[0]!.forEach((item, idx) => orderInLayer.set(item.id, idx));
@@ -310,7 +336,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
             ) / bIn.length
           : b.origX;
 
-      // Place real nodes before dummy nodes when tied so real nodes sit cleanly on the left/right
       if (Math.abs(aScore - bScore) < 0.01 && a.isDummy !== b.isDummy) {
         return a.isDummy ? 1 : -1;
       }
@@ -319,13 +344,11 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
     items.forEach((item, idx) => orderInLayer.set(item.id, idx));
   }
 
-  // 5. Assign X coordinates across layers (including dummy corridors!)
   const H_GAP = 265;
   const V_START = 95;
   const V_GAP = 190;
   const BASE_CENTER_X = 640;
 
-  // Build primary spanning tree on the augmented graph (real + dummy nodes)
   const treeChildren = new Map<string, string[]>();
   for (const item of itemsById.values()) {
     treeChildren.set(item.id, []);
@@ -392,7 +415,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
     rootCursor += w;
   }
 
-  // Refine merge nodes (multiple parents) & enforce non-overlapping spacing per layer
   for (let l = 1; l <= maxLayer; l++) {
     const items = layerItems[l]!;
     for (const item of items) {
@@ -405,7 +427,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
       }
     }
 
-    // Re-sort by desired X and enforce H_GAP between all items (including dummy nodes!)
     items.sort((a, b) => (posX.get(a.id) ?? 0) - (posX.get(b.id) ?? 0));
     if (items.length > 1) {
       const groupCenter =
@@ -420,7 +441,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
           posX.set(currId, prevVal + H_GAP);
         }
       }
-      // Re-center the layer around its original groupCenter
       const newCenter =
         items.reduce((sum, item) => sum + (posX.get(item.id) ?? startCenterX), 0) /
         items.length;
@@ -431,7 +451,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
     }
   }
 
-  // 6. Explicit Line-vs-Node Clearance Check for any long edge (u -> v where layer(v) - layer(u) > 1)
   const tempNodeById = new Map<string, FlowNode>();
   for (const n of prev.nodes) {
     const l = layerMap.get(n.id) ?? 0;
@@ -474,7 +493,6 @@ export function sortFlowchartLayout(prev: FlowchartData): FlowchartData {
     }
   }
 
-  // Ensure all real nodes sit to the right of the chapter sidebar
   const minX = Math.min(...Array.from(tempNodeById.values()).map((n) => n.x));
   const minAllowedX = CHAPTER_HEADER_WIDTH + 150;
   const shiftRight = minX < minAllowedX ? minAllowedX - minX : 0;
@@ -522,12 +540,18 @@ export function App() {
   });
 
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [plusMenu, setPlusMenu] = useState<ActivePlusMenu | null>(null);
   const [mergeMode, setMergeMode] = useState<MergeModeState | null>(null);
+  const [marquee, setMarquee] = useState<MarqueeSelectionState | null>(null);
   const [zoom, setZoom] = useState<number>(1.0);
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "offline">("saved");
+
+  // Undo / Redo history stacks & Toast notification
+  const [undoStack, setUndoStack] = useState<FlowchartData[]>([]);
+  const [redoStack, setRedoStack] = useState<FlowchartData[]>([]);
+  const [undoToast, setUndoToast] = useState<{ message: string; id: number } | null>(null);
 
   // Dragging node state
   const [draggingNode, setDraggingNode] = useState<{
@@ -550,7 +574,59 @@ export function App() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
+  const flowchartCanvasRef = useRef<HTMLDivElement | null>(null);
   const initialLoadDone = useRef(false);
+
+  // Helper to push a snapshot onto undoStack before destructive/structural changes
+  function pushUndoSnapshot(snapshot: FlowchartData) {
+    setUndoStack((prev) => {
+      const next = [...prev, cloneFlowchart(snapshot)];
+      if (next.length > MAX_UNDO_HISTORY) {
+        return next.slice(next.length - MAX_UNDO_HISTORY);
+      }
+      return next;
+    });
+    setRedoStack([]);
+  }
+
+  // Undo last action
+  function handleUndo() {
+    setUndoStack((prevUndo) => {
+      if (prevUndo.length === 0) return prevUndo;
+      const lastSnapshot = prevUndo[prevUndo.length - 1]!;
+      setRedoStack((prevRedo) => [...prevRedo, cloneFlowchart(chart)]);
+      setChart(lastSnapshot);
+      setUndoToast(null);
+      setPlusMenu(null);
+      const validIds = new Set(lastSnapshot.nodes.map((n) => n.id));
+      setSelectedNodeIds((ids) => ids.filter((id) => validIds.has(id)));
+      return prevUndo.slice(0, -1);
+    });
+  }
+
+  // Redo last undone action
+  function handleRedo() {
+    setRedoStack((prevRedo) => {
+      if (prevRedo.length === 0) return prevRedo;
+      const nextSnapshot = prevRedo[prevRedo.length - 1]!;
+      setUndoStack((prevUndo) => [...prevUndo, cloneFlowchart(chart)]);
+      setChart(nextSnapshot);
+      setUndoToast(null);
+      setPlusMenu(null);
+      const validIds = new Set(nextSnapshot.nodes.map((n) => n.id));
+      setSelectedNodeIds((ids) => ids.filter((id) => validIds.has(id)));
+      return prevRedo.slice(0, -1);
+    });
+  }
+
+  // Auto-hide undoToast after 8 seconds
+  useEffect(() => {
+    if (!undoToast) return;
+    const timer = setTimeout(() => {
+      setUndoToast(null);
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [undoToast]);
 
   // Load initial project from SQLite server on startup
   useEffect(() => {
@@ -612,36 +688,6 @@ export function App() {
     return () => clearTimeout(timer);
   }, [chart]);
 
-  // Close Escape for merge mode / popover / edge editor
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        setMergeMode(null);
-        setPlusMenu(null);
-        setSelectedEdgeId(null);
-      }
-    }
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
-
-  // Ctrl + Scroll Wheel to zoom in/out on the canvas
-  useEffect(() => {
-    const container = canvasScrollRef.current;
-    if (!container) return;
-
-    function handleWheel(e: WheelEvent) {
-      if (e.ctrlKey || e.metaKey) {
-        e.preventDefault();
-        const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP;
-        setZoom((prev) => clampZoom(prev + delta));
-      }
-    }
-
-    container.addEventListener("wheel", handleWheel, { passive: false });
-    return () => container.removeEventListener("wheel", handleWheel);
-  }, []);
-
   // Compute cumulative Y ranges for each chapter lane
   const chapterRanges = useMemo(() => {
     let currentTop = 0;
@@ -677,10 +723,106 @@ export function App() {
     return map;
   }, [chart.nodes]);
 
+  const selectedNodeSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds]);
+
+  // Right Drawer opens only when a single node is selected
   const selectedNode = useMemo(
-    () => (selectedNodeId ? nodeMap.get(selectedNodeId) ?? null : null),
-    [selectedNodeId, nodeMap]
+    () => (selectedNodeIds.length === 1 ? nodeMap.get(selectedNodeIds[0]!) ?? null : null),
+    [selectedNodeIds, nodeMap]
   );
+
+  // Bulk or single delete with Undo snapshot & Toast notification
+  function handleDeleteNodes(targetIds: string[]) {
+    const validTargetIds = targetIds.filter((id) => nodeMap.has(id));
+    if (validTargetIds.length === 0) return;
+
+    pushUndoSnapshot(chart);
+    setChart((prev) => deleteNodesFromChart(prev, validTargetIds));
+    setSelectedNodeIds((prev) => prev.filter((id) => !validTargetIds.includes(id)));
+    setPlusMenu(null);
+    setSelectedEdgeId(null);
+
+    const label =
+      validTargetIds.length === 1
+        ? `「${nodeMap.get(validTargetIds[0]!)?.title || "無題"}」を削除しました`
+        : `${validTargetIds.length} 個の図形をまとめて削除しました`;
+    setUndoToast({ message: label, id: Date.now() });
+  }
+
+  // Keyboard shortcuts: Escape, Delete/Backspace (bulk delete), Ctrl+Z (Undo), Ctrl+Y (Redo)
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      const isEditingInput =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+
+      if (e.key === "Escape") {
+        setMergeMode(null);
+        setPlusMenu(null);
+        setSelectedEdgeId(null);
+        setSelectedNodeIds([]);
+        return;
+      }
+
+      if (isEditingInput) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedNodeIds.length > 0) {
+        e.preventDefault();
+        handleDeleteNodes(selectedNodeIds);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  });
+
+  // Ctrl + Scroll Wheel to zoom in/out on the canvas
+  useEffect(() => {
+    const container = canvasScrollRef.current;
+    if (!container) return;
+
+    function handleWheel(e: WheelEvent) {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP;
+        setZoom((prev) => clampZoom(prev + delta));
+      }
+    }
+
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, []);
+
+  // Convert viewport mouse coordinates (clientX, clientY) to logical canvas coordinates
+  function clientToCanvasCoords(clientX: number, clientY: number): { x: number; y: number } {
+    const el = flowchartCanvasRef.current;
+    if (!el) return { x: clientX, y: clientY };
+    const rect = el.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) / zoom,
+      y: (clientY - rect.top) / zoom,
+    };
+  }
 
   // Determine which chapter lane a given Y coordinate falls into
   function getChapterForY(y: number) {
@@ -692,9 +834,9 @@ export function App() {
     return chapterRanges[chapterRanges.length - 1] ?? null;
   }
 
-  // Handle mouse move / up for node dragging & chapter resizing (accounting for zoom)
+  // Handle mouse move / up for node dragging, chapter resizing, and marquee selection
   useEffect(() => {
-    if (!draggingNode && !resizingChapter) return;
+    if (!draggingNode && !resizingChapter && !marquee) return;
 
     function onMouseMove(e: MouseEvent) {
       if (draggingNode) {
@@ -751,11 +893,59 @@ export function App() {
           };
         });
       }
+
+      if (marquee) {
+        const coords = clientToCanvasCoords(e.clientX, e.clientY);
+        const hasDragged =
+          marquee.hasDragged ||
+          Math.abs(coords.x - marquee.startX) > 4 ||
+          Math.abs(coords.y - marquee.startY) > 4;
+
+        const minX = Math.min(marquee.startX, coords.x);
+        const maxX = Math.max(marquee.startX, coords.x);
+        const minY = Math.min(marquee.startY, coords.y);
+        const maxY = Math.max(marquee.startY, coords.y);
+
+        if (hasDragged) {
+          const hitIds = chart.nodes
+            .filter((node) => {
+              const halfW = (node.type === "rect" ? RECT_WIDTH : DIAMOND_WIDTH) / 2;
+              const halfH = (node.type === "rect" ? RECT_HEIGHT : DIAMOND_HEIGHT) / 2;
+              return (
+                node.x + halfW >= minX &&
+                node.x - halfW <= maxX &&
+                node.y + halfH >= minY &&
+                node.y - halfH <= maxY
+              );
+            })
+            .map((n) => n.id);
+
+          const nextIds = marquee.additive
+            ? Array.from(new Set([...marquee.initialSelectedIds, ...hitIds]))
+            : hitIds;
+          setSelectedNodeIds(nextIds);
+        }
+
+        setMarquee((prev) =>
+          prev
+            ? {
+                ...prev,
+                currX: coords.x,
+                currY: coords.y,
+                hasDragged,
+              }
+            : null
+        );
+      }
     }
 
     function onMouseUp() {
+      if (marquee && !marquee.hasDragged && !marquee.additive) {
+        setSelectedNodeIds([]);
+      }
       setDraggingNode(null);
       setResizingChapter(null);
+      setMarquee(null);
     }
 
     window.addEventListener("mousemove", onMouseMove);
@@ -764,7 +954,7 @@ export function App() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [draggingNode, resizingChapter, zoom]);
+  }, [draggingNode, resizingChapter, marquee, zoom, chart.nodes]);
 
   // Check branch connection state of a node
   function getNodeBranchState(node: FlowNode) {
@@ -792,6 +982,7 @@ export function App() {
 
   // Trigger automatic hierarchical layout
   function handleAutoSort() {
+    pushUndoSnapshot(chart);
     setChart((prev) => sortFlowchartLayout(prev));
   }
 
@@ -799,6 +990,8 @@ export function App() {
   function handleCreateChildNode(sourceId: string, sourceSlot: number, targetType: NodeType) {
     const sourceNode = nodeMap.get(sourceId);
     if (!sourceNode) return;
+
+    pushUndoSnapshot(chart);
 
     const count = getNodeSlotCount(sourceNode);
     const horizontalSpread = count > 1 ? (sourceSlot - (count - 1) / 2) * 250 : 0;
@@ -884,13 +1077,14 @@ export function App() {
     });
 
     setPlusMenu(null);
-    setSelectedNodeId(newNodeId);
+    setSelectedNodeIds([newNodeId]);
     setSelectedEdgeId(null);
   }
 
   // Connect (merge) a slot to an existing node
   function handleConnectToExistingNode(sourceId: string, sourceSlot: number, targetId: string) {
     if (sourceId === targetId) return;
+    pushUndoSnapshot(chart);
     setChart((prev) => {
       const existing = prev.edges.find(
         (e) => e.sourceId === sourceId && e.sourceSlot === sourceSlot
@@ -926,6 +1120,7 @@ export function App() {
 
   // Disconnect an edge from a specific slot
   function handleDisconnectSlot(sourceId: string, sourceSlot: number) {
+    pushUndoSnapshot(chart);
     setChart((prev) => ({
       ...prev,
       edges: prev.edges.filter(
@@ -960,21 +1155,14 @@ export function App() {
     });
   }
 
-  // Delete a node and its incident edges
+  // Delete a single node (uses handleDeleteNodes so Undo & Toast work identically)
   function handleDeleteNode(nodeId: string) {
-    setChart((prev) => ({
-      ...prev,
-      nodes: prev.nodes.filter((n) => n.id !== nodeId),
-      edges: prev.edges.filter((e) => e.sourceId !== nodeId && e.targetId !== nodeId),
-    }));
-    if (selectedNodeId === nodeId) {
-      setSelectedNodeId(null);
-    }
-    setPlusMenu(null);
+    handleDeleteNodes([nodeId]);
   }
 
   // Chapter Lane management
   function handleAddChapter(afterIndex?: number) {
+    pushUndoSnapshot(chart);
     setChart((prev) => {
       const insertIdx =
         typeof afterIndex === "number" ? afterIndex + 1 : prev.chapters.length;
@@ -1002,6 +1190,7 @@ export function App() {
 
   function handleDeleteChapter(chapterId: string) {
     if (chart.chapters.length <= 1) return;
+    pushUndoSnapshot(chart);
     setChart((prev) => {
       const filtered = prev.chapters.filter((c) => c.id !== chapterId);
       return {
@@ -1033,12 +1222,13 @@ export function App() {
       try {
         const parsed = JSON.parse(String(reader.result)) as FlowchartData;
         if (parsed && Array.isArray(parsed.chapters) && Array.isArray(parsed.nodes)) {
+          pushUndoSnapshot(chart);
           setChart({
             ...parsed,
             id: parsed.id || chart.id || uid("proj"),
             name: parsed.name || file.name.replace(/\.json$/i, ""),
           });
-          setSelectedNodeId(null);
+          setSelectedNodeIds([]);
           setPlusMenu(null);
         }
       } catch {
@@ -1053,8 +1243,10 @@ export function App() {
   function handleNewProject() {
     const newId = uid("proj");
     const minimal = createMinimalFlowchart(newId, `新規ノベル企画 (${projects.length + 1})`);
+    setUndoStack([]);
+    setRedoStack([]);
     setChart(minimal);
-    setSelectedNodeId("node-start");
+    setSelectedNodeIds(["node-start"]);
     setPlusMenu(null);
     setMergeMode(null);
   }
@@ -1065,8 +1257,10 @@ export function App() {
       const res = await fetch(`/api/flowchart/${encodeURIComponent(projectId)}`);
       if (res.ok) {
         const data = (await res.json()) as FlowchartData;
+        setUndoStack([]);
+        setRedoStack([]);
         setChart(data);
-        setSelectedNodeId(null);
+        setSelectedNodeIds([]);
         setPlusMenu(null);
         setMergeMode(null);
       }
@@ -1077,6 +1271,7 @@ export function App() {
 
   // Add a root node if all nodes were deleted
   function handleAddRootNode() {
+    pushUndoSnapshot(chart);
     const newId = uid("node");
     const newNode: FlowNode = {
       id: newId,
@@ -1092,7 +1287,24 @@ export function App() {
       ...prev,
       nodes: [...prev.nodes, newNode],
     }));
-    setSelectedNodeId(newId);
+    setSelectedNodeIds([newId]);
+  }
+
+  // Handle clicking or Ctrl+clicking a node
+  function handleNodeClick(e: React.MouseEvent, nodeId: string) {
+    e.stopPropagation();
+    if (mergeMode) return;
+    setSelectedEdgeId(null);
+    setPlusMenu(null);
+
+    if (e.ctrlKey || e.metaKey) {
+      // Toggle this node in multi-selection
+      setSelectedNodeIds((prev) =>
+        prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : [...prev, nodeId]
+      );
+    } else {
+      setSelectedNodeIds([nodeId]);
+    }
   }
 
   return (
@@ -1145,6 +1357,25 @@ export function App() {
 
           <button
             type="button"
+            className="btn btn-secondary"
+            onClick={handleUndo}
+            disabled={undoStack.length === 0}
+            title="直前の削除や変更を元に戻す (Ctrl + Z)"
+          >
+            ↩ 元に戻す
+          </button>
+          {redoStack.length > 0 && (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={handleRedo}
+              title="やり直す (Ctrl + Y)"
+            >
+              ↪ やり直す
+            </button>
+          )}
+          <button
+            type="button"
             className="btn btn-primary"
             onClick={handleAutoSort}
             title="ツリー構造に合わせて図形の位置を上から下へ自動整列します"
@@ -1189,6 +1420,34 @@ export function App() {
         </div>
       </header>
 
+      {/* Multi-Selection Action Banner (shown when 2 or more shapes are selected) */}
+      {selectedNodeIds.length >= 2 && (
+        <div className="multi-select-banner">
+          <div className="multi-select-info">
+            <span className="multi-count-badge">{selectedNodeIds.length} 個の図形を選択中</span>
+            <span className="multi-select-hint">
+              （Ctrl + クリックで1つずつ選択解除 ／ Deleteキーでも一括削除可能）
+            </span>
+          </div>
+          <div className="multi-select-actions">
+            <button
+              type="button"
+              className="btn btn-danger-solid"
+              onClick={() => handleDeleteNodes(selectedNodeIds)}
+            >
+              🗑 選択した {selectedNodeIds.length} 個をまとめて削除
+            </button>
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={() => setSelectedNodeIds([])}
+            >
+              選択解除 (Esc)
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Merge Mode Banner */}
       {mergeMode && (
         <div className="merge-mode-banner">
@@ -1212,9 +1471,21 @@ export function App() {
           <div
             ref={canvasScrollRef}
             className="canvas-scroll-container"
-            onClick={() => {
+            onMouseDown={(e) => {
+              if (e.button !== 0) return;
               setPlusMenu(null);
               setSelectedEdgeId(null);
+              const coords = clientToCanvasCoords(e.clientX, e.clientY);
+              const additive = e.ctrlKey || e.metaKey;
+              setMarquee({
+                startX: coords.x,
+                startY: coords.y,
+                currX: coords.x,
+                currY: coords.y,
+                additive,
+                initialSelectedIds: additive ? [...selectedNodeIds] : [],
+                hasDragged: false,
+              });
             }}
           >
             {/* Outer wrapper scaled to match zoom dimensions for accurate scrollbars */}
@@ -1226,6 +1497,7 @@ export function App() {
               }}
             >
               <div
+                ref={flowchartCanvasRef}
                 className="flowchart-canvas"
                 style={{
                   width: `${totalCanvasWidth}px`,
@@ -1250,6 +1522,7 @@ export function App() {
                     <div
                       className="chapter-lane-sidebar"
                       style={{ width: `${CHAPTER_HEADER_WIDTH}px` }}
+                      onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => e.stopPropagation()}
                     >
                       <div className="chapter-badge-row">
@@ -1323,6 +1596,7 @@ export function App() {
                         : 0
                     }px`,
                   }}
+                  onMouseDown={(e) => e.stopPropagation()}
                 >
                   <button
                     type="button"
@@ -1338,15 +1612,29 @@ export function App() {
 
                 {/* Empty state button if all nodes were deleted */}
                 {chart.nodes.length === 0 && (
-                  <div className="empty-canvas-cta">
+                  <div
+                    className="empty-canvas-cta"
+                    onMouseDown={(e) => e.stopPropagation()}
+                  >
                     <p>キャンバス上に図形がありません。</p>
-                    <button
-                      type="button"
-                      className="btn btn-primary"
-                      onClick={handleAddRootNode}
-                    >
-                      ＋ 最初の四角（節）を作成する
-                    </button>
+                    <div style={{ display: "flex", gap: "8px", justifyContent: "center" }}>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        onClick={handleAddRootNode}
+                      >
+                        ＋ 最初の四角（節）を作成する
+                      </button>
+                      {undoStack.length > 0 && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          onClick={handleUndo}
+                        >
+                          ↩ 直前の削除を元に戻す
+                        </button>
+                      )}
+                    </div>
                   </div>
                 )}
 
@@ -1433,6 +1721,7 @@ export function App() {
                       <g
                         key={edge.id}
                         className="edge-group"
+                        onMouseDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
                           setSelectedEdgeId(edge.id);
@@ -1489,6 +1778,7 @@ export function App() {
                         left: `${midX}px`,
                         top: `${midY}px`,
                       }}
+                      onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => {
                         e.stopPropagation();
                         setSelectedEdgeId(edge.id);
@@ -1528,6 +1818,7 @@ export function App() {
                             className="edge-comment-delete-btn"
                             onClick={(e) => {
                               e.stopPropagation();
+                              pushUndoSnapshot(chart);
                               setChart((prev) => ({
                                 ...prev,
                                 edges: prev.edges.filter((item) => item.id !== edge.id),
@@ -1553,7 +1844,8 @@ export function App() {
 
                 {/* 3. Nodes & Circular (+) Buttons Layer */}
                 {chart.nodes.map((node) => {
-                  const isSelected = selectedNodeId === node.id;
+                  const isSelected = selectedNodeSet.has(node.id);
+                  const isMultiSelected = isSelected && selectedNodeIds.length >= 2;
                   const isMergeCandidate =
                     mergeMode !== null && mergeMode.sourceId !== node.id;
                   const branchState = getNodeBranchState(node);
@@ -1566,9 +1858,9 @@ export function App() {
                         <div
                           className={`flow-node rect-node ${
                             isSelected ? "node-selected" : ""
-                          } ${node.isEnd ? "rect-node-end" : ""} ${
-                            isMergeCandidate ? "node-merge-target" : ""
-                          }`}
+                          } ${isMultiSelected ? "node-multi-selected" : ""} ${
+                            node.isEnd ? "rect-node-end" : ""
+                          } ${isMergeCandidate ? "node-merge-target" : ""}`}
                           style={{
                             left: `${node.x - RECT_WIDTH / 2}px`,
                             top: `${node.y - RECT_HEIGHT / 2}px`,
@@ -1588,6 +1880,9 @@ export function App() {
                               }
                               return;
                             }
+                            if (e.ctrlKey || e.metaKey) {
+                              return;
+                            }
                             setDraggingNode({
                               nodeId: node.id,
                               startX: e.clientX,
@@ -1597,13 +1892,7 @@ export function App() {
                               hasMoved: false,
                             });
                           }}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (mergeMode) return;
-                            setSelectedNodeId(node.id);
-                            setSelectedEdgeId(null);
-                            setPlusMenu(null);
-                          }}
+                          onClick={(e) => handleNodeClick(e, node.id)}
                         >
                           <div className="rect-node-header">
                             <span className="node-kind-tag">
@@ -1628,8 +1917,8 @@ export function App() {
                               ? "diamond-incomplete-red"
                               : "diamond-complete"
                           } ${isSelected ? "node-selected" : ""} ${
-                            isMergeCandidate ? "node-merge-target" : ""
-                          }`}
+                            isMultiSelected ? "node-multi-selected" : ""
+                          } ${isMergeCandidate ? "node-merge-target" : ""}`}
                           style={{
                             left: `${node.x - DIAMOND_WIDTH / 2}px`,
                             top: `${node.y - DIAMOND_HEIGHT / 2}px`,
@@ -1649,6 +1938,9 @@ export function App() {
                               }
                               return;
                             }
+                            if (e.ctrlKey || e.metaKey) {
+                              return;
+                            }
                             setDraggingNode({
                               nodeId: node.id,
                               startX: e.clientX,
@@ -1658,13 +1950,7 @@ export function App() {
                               hasMoved: false,
                             });
                           }}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (mergeMode) return;
-                            setSelectedNodeId(node.id);
-                            setSelectedEdgeId(null);
-                            setPlusMenu(null);
-                          }}
+                          onClick={(e) => handleNodeClick(e, node.id)}
                         >
                           <svg
                             className="diamond-shape-svg"
@@ -1730,6 +2016,7 @@ export function App() {
                                 ? `分岐 ${slotIdx + 1} の接続先を追加・変更`
                                 : "次の図形（四角またはひし形）を追加"
                             }
+                            onMouseDown={(e) => e.stopPropagation()}
                             onClick={(e) => {
                               e.stopPropagation();
                               setMergeMode(null);
@@ -1755,7 +2042,20 @@ export function App() {
                   );
                 })}
 
-                {/* 4. Popover Menu when a Circular (+) Button is clicked */}
+                {/* 4. Marquee Rubber-band Selection Box */}
+                {marquee && marquee.hasDragged && (
+                  <div
+                    className="marquee-selection-box"
+                    style={{
+                      left: `${Math.min(marquee.startX, marquee.currX)}px`,
+                      top: `${Math.min(marquee.startY, marquee.currY)}px`,
+                      width: `${Math.abs(marquee.currX - marquee.startX)}px`,
+                      height: `${Math.abs(marquee.currY - marquee.startY)}px`,
+                    }}
+                  />
+                )}
+
+                {/* 5. Popover Menu when a Circular (+) Button is clicked */}
                 {plusMenu && (
                   <div
                     className="plus-popover-menu"
@@ -1763,6 +2063,7 @@ export function App() {
                       left: `${Math.max(20, plusMenu.x - 115)}px`,
                       top: `${plusMenu.y}px`,
                     }}
+                    onMouseDown={(e) => e.stopPropagation()}
                     onClick={(e) => e.stopPropagation()}
                   >
                     <div className="plus-popover-header">
@@ -1846,9 +2147,36 @@ export function App() {
             </div>
           </div>
 
+          {/* Undo Toast Notification after Deletion */}
+          {undoToast && undoStack.length > 0 && (
+            <div
+              className="undo-toast-bar"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <span className="undo-toast-message">🗑 {undoToast.message}</span>
+              <button
+                type="button"
+                className="undo-toast-btn"
+                onClick={handleUndo}
+              >
+                ↩ 元に戻す (Ctrl+Z)
+              </button>
+              <button
+                type="button"
+                className="undo-toast-close"
+                onClick={() => setUndoToast(null)}
+                title="閉じる"
+              >
+                ×
+              </button>
+            </div>
+          )}
+
           {/* Bottom-Right Floating Zoom Controls (＋ / － / リセット) */}
           <div
             className="floating-zoom-controls"
+            onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             title="Ctrl + マウスホイールでも拡大・縮小できます"
           >
@@ -1881,7 +2209,7 @@ export function App() {
           </div>
         </div>
 
-        {/* Right Side Drawer (四角 / ひし形 クリック時に表示) */}
+        {/* Right Side Drawer (四角 / ひし形 単一選択時に表示) */}
         <aside className={`right-drawer ${selectedNode ? "drawer-open" : ""}`}>
           {selectedNode ? (
             <div className="drawer-content">
@@ -1907,7 +2235,7 @@ export function App() {
                 <button
                   type="button"
                   className="drawer-close-btn"
-                  onClick={() => setSelectedNodeId(null)}
+                  onClick={() => setSelectedNodeIds([])}
                   title="ドロワーを閉じる"
                 >
                   ×
@@ -2071,7 +2399,7 @@ export function App() {
                                   <div className="slot-target-info">
                                     <span
                                       className="slot-target-link"
-                                      onClick={() => setSelectedNodeId(target.id)}
+                                      onClick={() => setSelectedNodeIds([target.id])}
                                     >
                                       → {target.title || "（無題）"}
                                     </span>

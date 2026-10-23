@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { sortFlowchartLayout } from "./App";
+import { cloneFlowchart, deleteNodesFromChart, sortFlowchartLayout } from "./App";
 import { deleteProject, getFlowchart, listProjects, saveFlowchart } from "./db";
-import { createMinimalFlowchart } from "./defaultData";
+import { createInitialFlowchart, createMinimalFlowchart } from "./defaultData";
 import type { FlowchartData } from "./types";
 
 describe("SQLite Flowchart Persistence & Auto-Sort Layout", () => {
@@ -78,12 +78,36 @@ describe("SQLite Flowchart Persistence & Auto-Sort Layout", () => {
     const n2 = sorted.nodes.find((n) => n.id === "n2")!;
     const n3 = sorted.nodes.find((n) => n.id === "n3")!;
 
-    // Hierarchical Y ordering: 導入 < 2節 < 3節
     expect(n1.y).toBeLessThan(n2.y);
     expect(n2.y).toBeLessThan(n3.y);
 
-    // Line from n1 to n3 at y = n2.y must not pass through n2's box (half-width 105px)
     const lineXAtN2 = n1.x + (n3.x - n1.x) * ((n2.y - n1.y) / (n3.y - n1.y));
     expect(Math.abs(n2.x - lineXAtN2)).toBeGreaterThanOrEqual(150);
+  });
+
+  test("bulk node deletion removes selected nodes and incident edges, and snapshot restores all data", () => {
+    const original = createInitialFlowchart("test-bulk", "一括削除テスト");
+    const snapshot = cloneFlowchart(original);
+
+    // Bulk delete node-3 and node-5
+    const afterDelete = deleteNodesFromChart(original, ["node-3", "node-5"]);
+    expect(afterDelete.nodes.length).toBe(original.nodes.length - 2);
+    expect(afterDelete.nodes.some((n) => n.id === "node-3")).toBe(false);
+    expect(afterDelete.nodes.some((n) => n.id === "node-5")).toBe(false);
+    // Incident edges to node-3 or node-5 are also removed
+    expect(
+      afterDelete.edges.some(
+        (e) =>
+          e.sourceId === "node-3" ||
+          e.targetId === "node-3" ||
+          e.sourceId === "node-5" ||
+          e.targetId === "node-5"
+      )
+    ).toBe(false);
+
+    // Undo snapshot remains completely intact with all nodes, edges, and labels
+    expect(snapshot.nodes.length).toBe(6);
+    expect(snapshot.edges.length).toBe(5);
+    expect(snapshot.edges.find((e) => e.id === "edge-3")?.label).toBe("SAN値が80以下の場合");
   });
 });
