@@ -102,9 +102,12 @@ bun test
    - **方法A：Cloudflare Zero Trust (Access) を使う場合（推奨）**:
      1. Cloudflare ダッシュボードの **Zero Trust > Access > Applications** から **Self-hosted** アプリケーションを作成し、Worker のドメイン（`novel-chart-builder.<サブドメイン>.workers.dev`）を登録します。
      2. ログイン方法に **Google** を指定し、許可する自分の Google メールアドレスを Allow ポリシーに設定します。
-     3. （任意・二重防御）[`wrangler.jsonc`](./wrangler.jsonc) の `vars.ALLOWED_EMAILS` にも自分のメールアドレス（例: `"your-email@gmail.com"`）を設定しておくと、Worker 側でも全 `/api/*` リクエストでメールアドレスを検証します。
+     3. （任意・二重防御）リポジトリにメールアドレスを残さずに Worker 側でも検証したい場合は、暗号化シークレットとして登録します：
+        ```bash
+        bun x wrangler secret put ALLOWED_EMAILS
+        ```
    - **方法B：アプリ内蔵の Google ログインボタン (`GOOGLE_CLIENT_ID`) を使う場合**:
-     1. [`wrangler.jsonc`](./wrangler.jsonc) の `vars` に `"GOOGLE_CLIENT_ID"` と `"ALLOWED_EMAILS"`（許可するGoogleメールアドレス）を設定します。
+     1. リポジトリにメールアドレスを含めないよう、`bun x wrangler secret put ALLOWED_EMAILS`（または Cloudflare ダッシュボードの **Workers & Pages > Settings > Variables and Secrets**）で設定します。
 5. **ビルド＆デプロイ**:
    ```bash
    bun run cf:deploy

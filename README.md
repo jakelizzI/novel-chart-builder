@@ -96,10 +96,12 @@ This project includes a zero-dependency Cloudflare Worker ([`src/worker.ts`](./s
    - **Option A — Cloudflare Zero Trust (Access) (Recommended)**:
      1. In the Cloudflare dashboard, navigate to **Zero Trust > Access > Applications** and add a **Self-hosted** application for your Worker's domain (`novel-chart-builder.<your-subdomain>.workers.dev`).
      2. Configure **Google** as the Identity Provider and create an Allow policy for your Google email address.
-     3. *(Optional defense-in-depth)* Set `"ALLOWED_EMAILS": "your-email@gmail.com"` in [`wrangler.jsonc`](./wrangler.jsonc) so the Worker also verifies the email on every `/api/*` request.
+     3. *(Optional defense-in-depth, without exposing your email in Git)* Store your allowed email as an encrypted Cloudflare Secret:
+        ```bash
+        bun x wrangler secret put ALLOWED_EMAILS
+        ```
    - **Option B — Built-in Google Sign-In (`GOOGLE_CLIENT_ID`)**:
-     1. Set `"GOOGLE_CLIENT_ID"` and `"ALLOWED_EMAILS"` in the `"vars"` section of [`wrangler.jsonc`](./wrangler.jsonc).
-     2. Optionally set a secret for HMAC session signing: `bun x wrangler secret put SESSION_SECRET`.
+     1. Store `ALLOWED_EMAILS` and `GOOGLE_CLIENT_ID` via `bun x wrangler secret put ALLOWED_EMAILS` (or in the Cloudflare Dashboard under **Workers & Pages > Settings > Variables and Secrets**) so no personal addresses are committed to the repository.
 5. **Build and deploy**:
    ```bash
    bun run cf:deploy

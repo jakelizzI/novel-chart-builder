@@ -1622,8 +1622,8 @@ export function App() {
                     Cloudflare ダッシュボードの <em>Zero Trust &gt; Access &gt; Applications</em> でこの Worker ドメインを登録し、Google 認証と許可メールアドレスのポリシーを設定してください。
                   </li>
                   <li>
-                    <strong>アプリ単体で Google 認証を使う場合：</strong>
-                    <code>wrangler.jsonc</code> の <code>vars</code> に <code>GOOGLE_CLIENT_ID</code> と <code>ALLOWED_EMAILS</code>（許可するGoogleメールアドレス）を設定してデプロイしてください。
+                    <strong>アプリ単体で Google 認証を使う場合（リポジトリにメアドを残さない方法）：</strong>
+                    <code>bun x wrangler secret put ALLOWED_EMAILS</code> で許可するGoogleメールアドレスをシークレット登録してください。
                   </li>
                 </ol>
               </div>
