@@ -7,8 +7,8 @@
     "dev": "bun --watch src/server.ts",
     "start": "bun src/server.ts",
     "build": "bun build ./src/index.html --outdir ./dist --minify",
-    "cf:dev": "bun run build && bunx wrangler dev",
-    "cf:deploy": "bun run build && bunx wrangler deploy",
+    "cf:dev": "bun run build && bun x wrangler dev",
+    "cf:deploy": "bun run build && bun x wrangler deploy",
     "typecheck": "bun x tsc --noEmit"
   },
   "dependencies": {

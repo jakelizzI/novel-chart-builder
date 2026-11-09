@@ -82,14 +82,15 @@ bun test
 
 This project includes a zero-dependency Cloudflare Worker ([`src/worker.ts`](./src/worker.ts)) and D1 schema ([`schema.sql`](./schema.sql)) that can be deployed alongside any existing Workers on your Cloudflare account without conflict.
 
-1. **Create a dedicated D1 database** (once per account):
+1. **Log in to Cloudflare and create a dedicated D1 database** (once per account):
    ```bash
-   bunx wrangler d1 create novel-chart-builder-db
+   bun x wrangler login
+   bun x wrangler d1 create novel-chart-builder-db
    ```
 2. **Copy the returned `database_id`** into [`wrangler.jsonc`](./wrangler.jsonc).
 3. **Initialize the D1 tables** (optional — [`src/worker.ts`](./src/worker.ts) also auto-initializes tables on first request):
    ```bash
-   bunx wrangler d1 execute novel-chart-builder-db --remote --file=./schema.sql
+   bun x wrangler d1 execute novel-chart-builder-db --remote --file=./schema.sql
    ```
 4. **Build and deploy**:
    ```bash

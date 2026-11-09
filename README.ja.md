@@ -88,14 +88,15 @@ bun test
 
 追加の外部ライブラリに依存しない Cloudflare Worker エントリポイント（[`src/worker.ts`](./src/worker.ts)）および D1 スキーマ（[`schema.sql`](./schema.sql)）を同梱しています。既存の他プロジェクトの Worker や D1 データベースとは別名で独立して動作するため、競合しません。
 
-1. **専用の D1 データベースを作成（初回のみ）**:
+1. **Cloudflareへのログインと専用の D1 データベース作成（初回のみ）**:
    ```bash
-   bunx wrangler d1 create novel-chart-builder-db
+   bun x wrangler login
+   bun x wrangler d1 create novel-chart-builder-db
    ```
 2. 出力された `database_id` を [`wrangler.jsonc`](./wrangler.jsonc) の `database_id` に貼り付けます。
 3. **テーブルの初期化**（省略可：[`src/worker.ts`](./src/worker.ts) が初回アクセス時に自動作成もします）:
    ```bash
-   bunx wrangler d1 execute novel-chart-builder-db --remote --file=./schema.sql
+   bun x wrangler d1 execute novel-chart-builder-db --remote --file=./schema.sql
    ```
 4. **ビルド＆デプロイ**:
    ```bash
