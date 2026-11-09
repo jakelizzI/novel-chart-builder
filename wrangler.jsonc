@@ -13,5 +13,13 @@
 			"database_name": "novel-chart-builder-db",
 			"database_id": "c8e2e468-a70b-4957-b06e-819e453c6caf"
 		}
-	]
+	],
+	// 認証設定（Cloudflare Zero Trust Access または Google Identity Services）
+	// - ALLOWED_EMAILS: アクセスを許可するGoogleメールアドレス（カンマ区切り、例: "your-email@gmail.com"）
+	// - CF_ACCESS_TEAM_DOMAIN: (任意) Cloudflare Zero Trust のチームドメイン（例: "your-team"）で署名検証を行う場合
+	// - CF_ACCESS_AUD: (任意) Cloudflare Access Application の Audience (AUD) タグ
+	// - GOOGLE_CLIENT_ID: (任意) Cloudflare Access を使わずアプリ単体で Google ログインボタンを表示する場合の Client ID
+	"vars": {
+		"ALLOWED_EMAILS": ""
+	}
 }

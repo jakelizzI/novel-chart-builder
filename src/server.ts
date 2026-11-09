@@ -9,6 +9,16 @@ const server = Bun.serve({
   routes: {
     "/": indexHtml,
 
+    "/api/auth/me": {
+      GET() {
+        return Response.json({
+          authenticated: true,
+          email: "local@dev",
+          authMode: "local",
+        });
+      },
+    },
+
     "/api/projects": {
       GET() {
         const projects = listProjects();

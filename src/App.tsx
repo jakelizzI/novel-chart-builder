@@ -601,6 +601,19 @@ export function App() {
   const [zoom, setZoom] = useState<number>(1.0);
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "offline">("saved");
 
+  // Authentication state (Cloudflare Zero Trust Access or Google Sign-In)
+  const [authState, setAuthState] = useState<
+    "checking" | "authenticated" | "unauthenticated" | "forbidden"
+  >("checking");
+  const [authUser, setAuthUser] = useState<{
+    email?: string;
+    name?: string;
+    authMode?: string;
+    reason?: string;
+    googleClientId?: string | null;
+  } | null>(null);
+  const googleBtnRef = useRef<HTMLDivElement | null>(null);
+
   // Undo / Redo history stacks & Toast notification
   const [undoStack, setUndoStack] = useState<FlowchartData[]>([]);
   const [redoStack, setRedoStack] = useState<FlowchartData[]>([]);
@@ -687,33 +700,171 @@ export function App() {
     return () => clearTimeout(timer);
   }, [undoToast]);
 
-  // Load initial project from SQLite server on startup
-  useEffect(() => {
-    async function loadFromServer() {
-      try {
-        const projRes = await fetch("/api/projects");
-        if (projRes.ok) {
-          const list = (await projRes.json()) as ProjectSummary[];
-          setProjects(list);
-          const targetId = list[0]?.id ?? "default";
-          const chartRes = await fetch(`/api/flowchart/${encodeURIComponent(targetId)}`);
-          if (chartRes.ok) {
-            const serverChart = (await chartRes.json()) as FlowchartData;
-            setChart(serverChart);
-            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(serverChart));
-          }
+  // Load project list and initial flowchart after authentication succeeds
+  async function fetchProjectsAndInitialChart() {
+    try {
+      const projRes = await fetch("/api/projects");
+      if (projRes.status === 401) {
+        setAuthState("unauthenticated");
+        return;
+      }
+      if (projRes.status === 403) {
+        setAuthState("forbidden");
+        return;
+      }
+      if (projRes.ok) {
+        const list = (await projRes.json()) as ProjectSummary[];
+        setProjects(list);
+        const targetId = list[0]?.id ?? "default";
+        const chartRes = await fetch(`/api/flowchart/${encodeURIComponent(targetId)}`);
+        if (chartRes.ok) {
+          const serverChart = (await chartRes.json()) as FlowchartData;
+          setChart(serverChart);
+          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(serverChart));
         }
-        initialLoadDone.current = true;
+      }
+      initialLoadDone.current = true;
+    } catch {
+      setSaveStatus("offline");
+      initialLoadDone.current = true;
+    }
+  }
+
+  // Check authentication & load initial project from server on startup
+  useEffect(() => {
+    async function initAuthAndLoad() {
+      try {
+        const authRes = await fetch("/api/auth/me");
+        if (authRes.status === 401) {
+          const info = await authRes.json().catch(() => ({}));
+          setAuthUser(info);
+          setAuthState("unauthenticated");
+          return;
+        }
+        if (authRes.status === 403) {
+          const info = await authRes.json().catch(() => ({}));
+          setAuthUser(info);
+          setAuthState("forbidden");
+          return;
+        }
+        if (authRes.ok) {
+          const info = await authRes.json().catch(() => ({}));
+          setAuthUser(info);
+          setAuthState("authenticated");
+          await fetchProjectsAndInitialChart();
+          return;
+        }
+        // Fallback if /api/auth/me is not present
+        setAuthState("authenticated");
+        await fetchProjectsAndInitialChart();
       } catch {
+        // Offline / static local fallback
+        setAuthState("authenticated");
         setSaveStatus("offline");
         initialLoadDone.current = true;
       }
     }
-    loadFromServer();
+    initAuthAndLoad();
   }, []);
+
+  // Render Google Identity Services Sign-In button when GOOGLE_CLIENT_ID is configured
+  useEffect(() => {
+    if (authState !== "unauthenticated" || !authUser?.googleClientId) return;
+    const clientId = authUser.googleClientId;
+
+    function renderGoogleButton() {
+      const g = (window as unknown as {
+        google?: {
+          accounts?: {
+            id?: {
+              initialize: (cfg: {
+                client_id: string;
+                callback: (resp: { credential?: string }) => void;
+              }) => void;
+              renderButton: (el: HTMLElement, opts: Record<string, unknown>) => void;
+            };
+          };
+        };
+      }).google;
+
+      if (!g?.accounts?.id || !googleBtnRef.current) return;
+
+      g.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          if (!response.credential) return;
+          try {
+            const res = await fetch("/api/auth/google", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ credential: response.credential }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.authenticated) {
+              setAuthUser(data);
+              setAuthState("authenticated");
+              await fetchProjectsAndInitialChart();
+            } else if (res.status === 403) {
+              setAuthUser(data);
+              setAuthState("forbidden");
+            } else {
+              setAuthUser({
+                ...authUser,
+                reason: data.error || "Google認証に失敗しました。",
+              });
+            }
+          } catch {
+            setAuthUser({
+              ...authUser,
+              reason: "認証サーバーとの通信に失敗しました。",
+            });
+          }
+        },
+      });
+
+      googleBtnRef.current.innerHTML = "";
+      g.accounts.id.renderButton(googleBtnRef.current, {
+        theme: "outline",
+        size: "large",
+        text: "signin_with",
+        shape: "rectangular",
+        width: 280,
+      });
+    }
+
+    const existingScript = document.querySelector(
+      'script[src="https://accounts.google.com/gsi/client"]'
+    );
+    if (existingScript) {
+      renderGoogleButton();
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = renderGoogleButton;
+    document.head.appendChild(script);
+  }, [authState, authUser?.googleClientId]);
+
+  async function handleLogout() {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } catch {
+      // ignore
+    }
+    if (authUser?.authMode === "cloudflare-access") {
+      window.location.href = "/cdn-cgi/access/logout";
+      return;
+    }
+    initialLoadDone.current = false;
+    setAuthState("unauthenticated");
+  }
 
   // Auto-save to localStorage & SQLite backend
   useEffect(() => {
+    if (authState !== "authenticated") return;
     try {
       localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(chart));
     } catch {
@@ -745,7 +896,7 @@ export function App() {
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [chart]);
+  }, [chart, authState]);
 
   // Compute cumulative Y ranges for each chapter lane
   const chapterRanges = useMemo(() => {
@@ -870,7 +1021,7 @@ export function App() {
 
     container.addEventListener("wheel", handleWheel, { passive: false });
     return () => container.removeEventListener("wheel", handleWheel);
-  }, []);
+  }, [authState]);
 
   // Convert viewport mouse coordinates (clientX, clientY) to logical canvas coordinates
   function clientToCanvasCoords(clientX: number, clientY: number): { x: number; y: number } {
@@ -1410,6 +1561,79 @@ export function App() {
     }
   }
 
+  // Authentication Gate: prevent unauthorized access before rendering the flowchart
+  if (authState !== "authenticated") {
+    return (
+      <div className="auth-gate-screen">
+        <div className="auth-gate-card">
+          <div className="auth-gate-logo">◇</div>
+          <h1 className="auth-gate-title">Novel Flowchart Builder</h1>
+
+          {authState === "checking" && (
+            <p className="auth-gate-subtitle">認証状態を確認しています...</p>
+          )}
+
+          {authState === "forbidden" && (
+            <>
+              <div className="auth-error-box">
+                <strong>アクセス権限がありません (403 Forbidden)</strong>
+                <p>{authUser?.reason || "このGoogleアカウントにはアクセス権限が付与されていません。"}</p>
+                {authUser?.email && (
+                  <p className="auth-current-email">ログイン中: {authUser.email}</p>
+                )}
+              </div>
+              <div className="auth-gate-actions">
+                <button type="button" className="btn btn-secondary" onClick={handleLogout}>
+                  別のアカウントでログイン
+                </button>
+              </div>
+            </>
+          )}
+
+          {authState === "unauthenticated" && (
+            <>
+              <p className="auth-gate-subtitle">
+                このアプリケーションを閲覧・編集するには Google アカウントによる認証が必要です。
+              </p>
+
+              {authUser?.reason && (
+                <div className="auth-error-box">
+                  <p>{authUser.reason}</p>
+                </div>
+              )}
+
+              {authUser?.googleClientId && (
+                <div className="auth-google-btn-wrap">
+                  <div ref={googleBtnRef} />
+                </div>
+              )}
+
+              <div className="auth-gate-actions">
+                <a href="/cdn-cgi/access/login" className="btn btn-primary auth-cf-btn">
+                  🔒 Cloudflare Access (Google) でログイン
+                </a>
+              </div>
+
+              <div className="auth-setup-note">
+                <strong>管理者向けセットアップ案内：</strong>
+                <ol>
+                  <li>
+                    <strong>Cloudflare Zero Trust (Access) を使う場合：</strong>
+                    Cloudflare ダッシュボードの <em>Zero Trust &gt; Access &gt; Applications</em> でこの Worker ドメインを登録し、Google 認証と許可メールアドレスのポリシーを設定してください。
+                  </li>
+                  <li>
+                    <strong>アプリ単体で Google 認証を使う場合：</strong>
+                    <code>wrangler.jsonc</code> の <code>vars</code> に <code>GOOGLE_CLIENT_ID</code> と <code>ALLOWED_EMAILS</code>（許可するGoogleメールアドレス）を設定してデプロイしてください。
+                  </li>
+                </ol>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       {/* Top Header Toolbar */}
@@ -1520,6 +1744,18 @@ export function App() {
             style={{ display: "none" }}
             onChange={handleImportJson}
           />
+          {authUser?.email && authUser.email !== "local@dev" && (
+            <div className="auth-user-pill" title={`ログイン中: ${authUser.email}`}>
+              <span className="auth-user-email">{authUser.email}</span>
+              <button
+                type="button"
+                className="btn btn-small auth-logout-btn"
+                onClick={handleLogout}
+              >
+                ログアウト
+              </button>
+            </div>
+          )}
         </div>
       </header>
 
