@@ -1,4 +1,4 @@
-name: Dependabot Sunday Verify & Merge
+name: Dependabot Sunday Verify, Merge & Deploy
 
 on:
   # 毎週日曜日 09:00 (JST) / 00:00 (UTC) に実行
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   verify-and-merge:
-    name: Verify & Merge Dependabot PRs on Sunday
+    name: Verify, Merge Dependabot PRs & Deploy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main branch
@@ -26,11 +26,10 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Verify, merge open Dependabot PRs, and deploy to Cloudflare
+      - name: Verify and merge open Dependabot PRs
+        id: merge_prs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
 
@@ -40,61 +39,65 @@ jobs:
           # オープン中の Dependabot PR 番号を取得（古い順）
           PR_NUMBERS=$(gh pr list --author "app/dependabot" --state open --json number --jq '.[].number' | sort -n)
 
-          if [ -z "$PR_NUMBERS" ]; then
-            echo "現在オープン中の Dependabot PR はありません。"
-            exit 0
-          fi
-
           MERGED_COUNT=0
 
-          for PR_NUMBER in $PR_NUMBERS; do
-            echo "=========================================="
-            echo "Verifying Dependabot PR #${PR_NUMBER}..."
-            echo "=========================================="
+          if [ -z "$PR_NUMBERS" ]; then
+            echo "現在オープン中の Dependabot PR はありません。"
+          else
+            for PR_NUMBER in $PR_NUMBERS; do
+              echo "=========================================="
+              echo "Verifying Dependabot PR #${PR_NUMBER}..."
+              echo "=========================================="
 
-            # PRブランチをチェックアウト
-            gh pr checkout "$PR_NUMBER"
+              # PRブランチをチェックアウト
+              gh pr checkout "$PR_NUMBER"
 
-            # 最新の main とコンフリクトしないかマージテスト
-            git fetch origin main
-            if ! git merge --no-edit origin/main; then
-              echo "PR #${PR_NUMBER} has merge conflicts with main. Requesting @dependabot rebase..."
-              git merge --abort || true
-              gh pr comment "$PR_NUMBER" --body "@dependabot rebase"
+              # 最新の main とコンフリクトしないかマージテスト
+              git fetch origin main
+              if ! git merge --no-edit origin/main; then
+                echo "PR #${PR_NUMBER} has merge conflicts with main. Requesting @dependabot rebase..."
+                git merge --abort || true
+                gh pr comment "$PR_NUMBER" --body "@dependabot rebase"
+                git reset --hard
+                git clean -fd
+                git checkout main
+                continue
+              fi
+
+              # 依存関係のインストール・型チェック・テスト・ビルドをすべて検証
+              if bun install --frozen-lockfile && bun run typecheck && bun test && bun run build; then
+                echo "✅ Verification passed for PR #${PR_NUMBER}. Approving and merging..."
+                gh pr review "$PR_NUMBER" --approve
+                if gh pr merge "$PR_NUMBER" --squash --delete-branch || gh pr merge "$PR_NUMBER" --squash --auto; then
+                  MERGED_COUNT=$((MERGED_COUNT + 1))
+                fi
+              else
+                echo "❌ Verification failed for PR #${PR_NUMBER}. Skipping merge."
+              fi
+
               git reset --hard
               git clean -fd
               git checkout main
-              continue
-            fi
-
-            # 依存関係のインストール・型チェック・テスト・ビルドをすべて検証
-            if bun install --frozen-lockfile && bun run typecheck && bun test && bun run build; then
-              echo "✅ Verification passed for PR #${PR_NUMBER}. Approving and merging..."
-              gh pr review "$PR_NUMBER" --approve
-              if gh pr merge "$PR_NUMBER" --squash --delete-branch || gh pr merge "$PR_NUMBER" --squash --auto; then
-                MERGED_COUNT=$((MERGED_COUNT + 1))
-              fi
-            else
-              echo "❌ Verification failed for PR #${PR_NUMBER}. Skipping merge."
-            fi
-
-            git reset --hard
-            git clean -fd
-            git checkout main
-            git pull origin main
-          done
-
-          # 1件以上マージされた場合は最新の main を Cloudflare へ自動デプロイ
-          if [ "$MERGED_COUNT" -gt 0 ]; then
-            echo "=========================================="
-            echo "Deploying updated main branch to Cloudflare (${MERGED_COUNT} PR(s) merged)..."
-            echo "=========================================="
-            git checkout main
-            git pull origin main
-            bun install --frozen-lockfile
-            if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
-              echo "⚠️ CLOUDFLARE_API_TOKEN が未設定のため、Cloudflare へのデプロイをスキップしました。"
-              exit 0
-            fi
-            bun run cf:deploy
+              git pull origin main
+            done
           fi
+
+          echo "merged_count=${MERGED_COUNT}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Cloudflare Workers
+        if: steps.merge_prs.outputs.merged_count != '0' || github.event_name == 'workflow_dispatch'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          git checkout main
+          git pull origin main
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "⚠️ CLOUDFLARE_API_TOKEN が未設定のため、Cloudflare へのデプロイをスキップしました。"
+            exit 0
+          fi
+          bun run cf:deploy
