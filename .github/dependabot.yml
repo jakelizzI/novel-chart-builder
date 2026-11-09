@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Bun (package.json & bun.lock) の依存関係更新
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "Asia/Tokyo"
+    # リリースから1週間（7日間）経過して安定したバージョンのみを対象にする
+    cooldown:
+      default-days: 7
+    # マージ時の bun.lock 競合を防ぐため1つのPRにまとめる
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
+
+  # GitHub Actions ワークフロー内のアクション更新
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "Asia/Tokyo"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"

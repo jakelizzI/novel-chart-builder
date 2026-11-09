@@ -1,0 +1,79 @@
+name: Dependabot Sunday Verify & Merge
+
+on:
+  # 毎週日曜日 09:00 (JST) / 00:00 (UTC) に実行
+  schedule:
+    - cron: "0 0 * * 0"
+  # 手動実行もサポート
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  verify-and-merge:
+    name: Verify & Merge Dependabot PRs on Sunday
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Verify and merge open Dependabot PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # オープン中の Dependabot PR 番号を取得（古い順）
+          PR_NUMBERS=$(gh pr list --author "app/dependabot" --state open --json number --jq '.[].number' | sort -n)
+
+          if [ -z "$PR_NUMBERS" ]; then
+            echo "現在オープン中の Dependabot PR はありません。"
+            exit 0
+          fi
+
+          for PR_NUMBER in $PR_NUMBERS; do
+            echo "=========================================="
+            echo "Verifying Dependabot PR #${PR_NUMBER}..."
+            echo "=========================================="
+
+            # PRブランチをチェックアウト
+            gh pr checkout "$PR_NUMBER"
+
+            # 最新の main とコンフリクトしないかマージテスト
+            git fetch origin main
+            if ! git merge --no-edit origin/main; then
+              echo "PR #${PR_NUMBER} has merge conflicts with main. Requesting @dependabot rebase..."
+              git merge --abort || true
+              gh pr comment "$PR_NUMBER" --body "@dependabot rebase"
+              git reset --hard
+              git clean -fd
+              git checkout main
+              continue
+            fi
+
+            # 依存関係のインストール・型チェック・テスト・ビルドをすべて検証
+            if bun install --frozen-lockfile && bun run typecheck && bun test && bun run build; then
+              echo "✅ Verification passed for PR #${PR_NUMBER}. Approving and merging..."
+              gh pr review "$PR_NUMBER" --approve
+              gh pr merge "$PR_NUMBER" --squash --delete-branch || gh pr merge "$PR_NUMBER" --squash --auto
+            else
+              echo "❌ Verification failed for PR #${PR_NUMBER}. Skipping merge."
+            fi
+
+            git reset --hard
+            git clean -fd
+            git checkout main
+            git pull origin main
+          done
