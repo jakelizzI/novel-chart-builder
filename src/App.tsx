@@ -598,7 +598,10 @@ export function App() {
   const [plusMenu, setPlusMenu] = useState<ActivePlusMenu | null>(null);
   const [mergeMode, setMergeMode] = useState<MergeModeState | null>(null);
   const [marquee, setMarquee] = useState<MarqueeSelectionState | null>(null);
-  const [zoom, setZoom] = useState<number>(1.0);
+  const [isMultiSelectMode, setIsMultiSelectMode] = useState<boolean>(false);
+  const [zoom, setZoom] = useState<number>(() =>
+    typeof window !== "undefined" && window.innerWidth <= 768 ? 0.8 : 1.0
+  );
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "offline">("saved");
 
   // Authentication state (Cloudflare Zero Trust Access or Google Sign-In)
@@ -1006,7 +1009,10 @@ export function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   });
 
-  // Ctrl + Scroll Wheel to zoom in/out on the canvas
+  // Ctrl + Scroll Wheel AND 2-finger pinch-to-zoom on the canvas
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+
   useEffect(() => {
     const container = canvasScrollRef.current;
     if (!container) return;
@@ -1019,11 +1025,70 @@ export function App() {
       }
     }
 
+    let pinchStartDist: number | null = null;
+    let pinchStartZoom = 1.0;
+
+    function getTouchDistance(t1: Touch, t2: Touch): number {
+      const dx = t1.clientX - t2.clientX;
+      const dy = t1.clientY - t2.clientY;
+      return Math.hypot(dx, dy);
+    }
+
+    function handleTouchStart(e: TouchEvent) {
+      if (e.touches.length === 2) {
+        pinchStartDist = getTouchDistance(e.touches[0]!, e.touches[1]!);
+        pinchStartZoom = zoomRef.current;
+      }
+    }
+
+    function handleTouchMove(e: TouchEvent) {
+      if (e.touches.length === 2 && pinchStartDist && pinchStartDist > 10) {
+        if (e.cancelable) e.preventDefault();
+        const currDist = getTouchDistance(e.touches[0]!, e.touches[1]!);
+        const nextZoom = clampZoom(pinchStartZoom * (currDist / pinchStartDist));
+        setZoom(nextZoom);
+      }
+    }
+
+    function handleTouchEnd(e: TouchEvent) {
+      if (e.touches.length < 2) {
+        pinchStartDist = null;
+      }
+    }
+
     container.addEventListener("wheel", handleWheel, { passive: false });
-    return () => container.removeEventListener("wheel", handleWheel);
+    container.addEventListener("touchstart", handleTouchStart, { passive: true });
+    container.addEventListener("touchmove", handleTouchMove, { passive: false });
+    container.addEventListener("touchend", handleTouchEnd);
+    container.addEventListener("touchcancel", handleTouchEnd);
+    return () => {
+      container.removeEventListener("wheel", handleWheel);
+      container.removeEventListener("touchstart", handleTouchStart);
+      container.removeEventListener("touchmove", handleTouchMove);
+      container.removeEventListener("touchend", handleTouchEnd);
+      container.removeEventListener("touchcancel", handleTouchEnd);
+    };
   }, [authState]);
 
-  // Convert viewport mouse coordinates (clientX, clientY) to logical canvas coordinates
+  // Center horizontal scroll on mobile on initial render so root node is immediately in view
+  useEffect(() => {
+    if (authState !== "authenticated") return;
+    if (typeof window === "undefined" || window.innerWidth > 768) return;
+    const container = canvasScrollRef.current;
+    if (!container || chart.nodes.length === 0) return;
+
+    const topNode = chart.nodes.reduce(
+      (best, n) => (n.y < best.y ? n : best),
+      chart.nodes[0]!
+    );
+    const targetScrollLeft = Math.max(
+      0,
+      Math.round(topNode.x * zoomRef.current - window.innerWidth / 2 + 20)
+    );
+    container.scrollLeft = targetScrollLeft;
+  }, [authState]);
+
+  // Convert viewport mouse/touch coordinates (clientX, clientY) to logical canvas coordinates
   function clientToCanvasCoords(clientX: number, clientY: number): { x: number; y: number } {
     const el = flowchartCanvasRef.current;
     if (!el) return { x: clientX, y: clientY };
@@ -1044,22 +1109,8 @@ export function App() {
     return chapterRanges[chapterRanges.length - 1] ?? null;
   }
 
-  // Start dragging a single node OR the entire selected group if the clicked node is part of the selection
-  function handleNodeMouseDown(e: React.MouseEvent, node: FlowNode) {
-    if (e.button !== 0) return;
-    e.stopPropagation();
-
-    if (mergeMode) {
-      if (mergeMode.sourceId !== node.id) {
-        handleConnectToExistingNode(mergeMode.sourceId, mergeMode.sourceSlot, node.id);
-      }
-      return;
-    }
-
-    if (e.ctrlKey || e.metaKey) {
-      return;
-    }
-
+  // Shared helper to initiate dragging of a single node or multi-selected group
+  function startNodeDragSession(clientX: number, clientY: number, node: FlowNode) {
     const isPartOfSelection = selectedNodeSet.has(node.id);
     const movingIds =
       isPartOfSelection && selectedNodeIds.length >= 2 ? selectedNodeIds : [node.id];
@@ -1076,23 +1127,72 @@ export function App() {
     setDraggingNodes({
       clickedNodeId: node.id,
       wasAlreadyMultiSelected: isPartOfSelection && selectedNodeIds.length >= 2,
-      startX: e.clientX,
-      startY: e.clientY,
+      startX: clientX,
+      startY: clientY,
       origPositions,
       snapshotBeforeDrag: cloneFlowchart(chart),
       hasMoved: false,
     });
   }
 
-  // Handle mouse move / up for node(s) dragging, chapter resizing, and marquee selection
+  // Start dragging via Mouse
+  function handleNodeMouseDown(e: React.MouseEvent, node: FlowNode) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+
+    if (mergeMode) {
+      if (mergeMode.sourceId !== node.id) {
+        handleConnectToExistingNode(mergeMode.sourceId, mergeMode.sourceSlot, node.id);
+      }
+      return;
+    }
+
+    if (e.ctrlKey || e.metaKey || isMultiSelectMode) {
+      return;
+    }
+
+    startNodeDragSession(e.clientX, e.clientY, node);
+  }
+
+  // Start dragging via Touch (smartphone / tablet)
+  function handleNodeTouchStart(e: React.TouchEvent, node: FlowNode) {
+    if (e.touches.length !== 1) return;
+    e.stopPropagation();
+
+    if (mergeMode) {
+      if (mergeMode.sourceId !== node.id) {
+        handleConnectToExistingNode(mergeMode.sourceId, mergeMode.sourceSlot, node.id);
+      }
+      return;
+    }
+
+    // If tapping an unselected node while in multi-select mode, let onClick toggle selection;
+    // if tapping an already-selected node, allow dragging the selected group!
+    if (isMultiSelectMode && !selectedNodeSet.has(node.id)) {
+      return;
+    }
+
+    const touch = e.touches[0]!;
+    startNodeDragSession(touch.clientX, touch.clientY, node);
+  }
+
+  // Handle mouse & touch move / up for node(s) dragging, chapter resizing, and marquee selection
   useEffect(() => {
     if (!draggingNodes && !resizingChapter && !marquee) return;
 
-    function onMouseMove(e: MouseEvent) {
+    function handlePointerMove(
+      clientX: number,
+      clientY: number,
+      preventDefaultScroll?: () => void
+    ) {
       if (draggingNodes) {
-        const rawDx = (e.clientX - draggingNodes.startX) / zoom;
-        const rawDy = (e.clientY - draggingNodes.startY) / zoom;
+        const rawDx = (clientX - draggingNodes.startX) / zoom;
+        const rawDy = (clientY - draggingNodes.startY) / zoom;
         const moved = draggingNodes.hasMoved || Math.abs(rawDx) > 3 || Math.abs(rawDy) > 3;
+
+        if (moved) {
+          preventDefaultScroll?.();
+        }
 
         if (moved && !draggingNodes.hasMoved) {
           suppressClickAfterDragRef.current = true;
@@ -1108,7 +1208,8 @@ export function App() {
       }
 
       if (resizingChapter) {
-        const dy = (e.clientY - resizingChapter.startY) / zoom;
+        preventDefaultScroll?.();
+        const dy = (clientY - resizingChapter.startY) / zoom;
         const newHeight = Math.max(160, Math.round(resizingChapter.origHeight + dy));
         const actualDiff = newHeight - resizingChapter.origHeight;
 
@@ -1139,11 +1240,15 @@ export function App() {
       }
 
       if (marquee) {
-        const coords = clientToCanvasCoords(e.clientX, e.clientY);
+        const coords = clientToCanvasCoords(clientX, clientY);
         const hasDragged =
           marquee.hasDragged ||
           Math.abs(coords.x - marquee.startX) > 4 ||
           Math.abs(coords.y - marquee.startY) > 4;
+
+        if (hasDragged) {
+          preventDefaultScroll?.();
+        }
 
         const minX = Math.min(marquee.startX, coords.x);
         const maxX = Math.max(marquee.startX, coords.x);
@@ -1183,7 +1288,19 @@ export function App() {
       }
     }
 
-    function onMouseUp() {
+    function onMouseMove(e: MouseEvent) {
+      handlePointerMove(e.clientX, e.clientY);
+    }
+
+    function onTouchMove(e: TouchEvent) {
+      if (e.touches.length !== 1) return;
+      const touch = e.touches[0]!;
+      handlePointerMove(touch.clientX, touch.clientY, () => {
+        if (e.cancelable) e.preventDefault();
+      });
+    }
+
+    function onPointerEnd() {
       if (marquee && !marquee.hasDragged && !marquee.additive) {
         setSelectedNodeIds([]);
       }
@@ -1193,10 +1310,16 @@ export function App() {
     }
 
     window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mouseup", onPointerEnd);
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onPointerEnd);
+    window.addEventListener("touchcancel", onPointerEnd);
     return () => {
       window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("mouseup", onPointerEnd);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onPointerEnd);
+      window.removeEventListener("touchcancel", onPointerEnd);
     };
   }, [draggingNodes, resizingChapter, marquee, zoom, chart.nodes]);
 
@@ -1534,7 +1657,7 @@ export function App() {
     setSelectedNodeIds([newId]);
   }
 
-  // Handle clicking or Ctrl+clicking a node
+  // Handle clicking or Ctrl+clicking a node (or tapping when Multi-Select Mode is ON)
   function handleNodeClick(e: React.MouseEvent, nodeId: string) {
     e.stopPropagation();
     if (mergeMode) return;
@@ -1551,7 +1674,7 @@ export function App() {
     setSelectedEdgeId(null);
     setPlusMenu(null);
 
-    if (e.ctrlKey || e.metaKey) {
+    if (e.ctrlKey || e.metaKey || isMultiSelectMode) {
       // Toggle this node in multi-selection
       setSelectedNodeIds((prev) =>
         prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : [...prev, nodeId]
@@ -1711,6 +1834,14 @@ export function App() {
           </button>
           <button
             type="button"
+            className={`btn ${isMultiSelectMode ? "btn-primary" : "btn-secondary"}`}
+            onClick={() => setIsMultiSelectMode((prev) => !prev)}
+            title="複数選択モードのON/OFF（スマホ・タブレットでもタップやドラッグで複数選択できます）"
+          >
+            {isMultiSelectMode ? "☑ 複数選択ON" : "☐ 複数選択"}
+          </button>
+          <button
+            type="button"
             className="btn btn-secondary"
             onClick={() => handleAddChapter()}
           >
@@ -1759,29 +1890,38 @@ export function App() {
         </div>
       </header>
 
-      {/* Multi-Selection Action Banner (shown when 2 or more shapes are selected) */}
-      {selectedNodeIds.length >= 2 && (
+      {/* Multi-Selection Action Banner (shown when 2 or more shapes are selected, or when Multi-Select Mode is ON) */}
+      {(selectedNodeIds.length >= 2 || isMultiSelectMode) && (
         <div className="multi-select-banner">
           <div className="multi-select-info">
-            <span className="multi-count-badge">{selectedNodeIds.length} 個の図形を選択中</span>
+            <span className="multi-count-badge">
+              {selectedNodeIds.length > 0
+                ? `${selectedNodeIds.length} 個の図形を選択中`
+                : "複数選択モード ON"}
+            </span>
             <span className="multi-select-hint">
-              （選択した図形をドラッグしてまとめて移動 ／ Ctrl + クリックで個別解除 ／ Deleteで一括削除）
+              （図形をタップで追加・解除 ／ 選択図形をドラッグしてまとめて移動 ／ 一括削除）
             </span>
           </div>
           <div className="multi-select-actions">
-            <button
-              type="button"
-              className="btn btn-danger-solid"
-              onClick={() => handleDeleteNodes(selectedNodeIds)}
-            >
-              🗑 選択した {selectedNodeIds.length} 個をまとめて削除
-            </button>
+            {selectedNodeIds.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-danger-solid"
+                onClick={() => handleDeleteNodes(selectedNodeIds)}
+              >
+                🗑 {selectedNodeIds.length} 個を削除
+              </button>
+            )}
             <button
               type="button"
               className="btn btn-small"
-              onClick={() => setSelectedNodeIds([])}
+              onClick={() => {
+                setSelectedNodeIds([]);
+                setIsMultiSelectMode(false);
+              }}
             >
-              選択解除 (Esc)
+              選択解除
             </button>
           </div>
         </div>
@@ -1815,7 +1955,7 @@ export function App() {
               setPlusMenu(null);
               setSelectedEdgeId(null);
               const coords = clientToCanvasCoords(e.clientX, e.clientY);
-              const additive = e.ctrlKey || e.metaKey;
+              const additive = e.ctrlKey || e.metaKey || isMultiSelectMode;
               setMarquee({
                 startX: coords.x,
                 startY: coords.y,
@@ -1825,6 +1965,24 @@ export function App() {
                 initialSelectedIds: additive ? [...selectedNodeIds] : [],
                 hasDragged: false,
               });
+            }}
+            onTouchStart={(e) => {
+              if (e.touches.length !== 1) return;
+              setPlusMenu(null);
+              setSelectedEdgeId(null);
+              if (isMultiSelectMode) {
+                const touch = e.touches[0]!;
+                const coords = clientToCanvasCoords(touch.clientX, touch.clientY);
+                setMarquee({
+                  startX: coords.x,
+                  startY: coords.y,
+                  currX: coords.x,
+                  currY: coords.y,
+                  additive: true,
+                  initialSelectedIds: [...selectedNodeIds],
+                  hasDragged: false,
+                });
+              }
             }}
           >
             {/* Outer wrapper scaled to match zoom dimensions for accurate scrollbars */}
@@ -1862,6 +2020,7 @@ export function App() {
                       className="chapter-lane-sidebar"
                       style={{ width: `${CHAPTER_HEADER_WIDTH}px` }}
                       onMouseDown={(e) => e.stopPropagation()}
+                      onTouchStart={(e) => e.stopPropagation()}
                       onClick={(e) => e.stopPropagation()}
                     >
                       <div className="chapter-badge-row">
@@ -1914,6 +2073,19 @@ export function App() {
                           origHeight: ch.height,
                           chapterBottomYAtStart: ch.bottom,
                           shiftNodesBelow: !e.altKey,
+                          snapshotBeforeResize: cloneFlowchart(chart),
+                          hasResized: false,
+                        });
+                      }}
+                      onTouchStart={(e) => {
+                        if (e.touches.length !== 1) return;
+                        e.stopPropagation();
+                        setResizingChapter({
+                          chapterId: ch.id,
+                          startY: e.touches[0]!.clientY,
+                          origHeight: ch.height,
+                          chapterBottomYAtStart: ch.bottom,
+                          shiftNodesBelow: true,
                           snapshotBeforeResize: cloneFlowchart(chart),
                           hasResized: false,
                         });
@@ -2209,6 +2381,7 @@ export function App() {
                             height: `${RECT_HEIGHT}px`,
                           }}
                           onMouseDown={(e) => handleNodeMouseDown(e, node)}
+                          onTouchStart={(e) => handleNodeTouchStart(e, node)}
                           onClick={(e) => handleNodeClick(e, node.id)}
                         >
                           <div className="rect-node-header">
@@ -2243,6 +2416,7 @@ export function App() {
                             height: `${DIAMOND_HEIGHT}px`,
                           }}
                           onMouseDown={(e) => handleNodeMouseDown(e, node)}
+                          onTouchStart={(e) => handleNodeTouchStart(e, node)}
                           onClick={(e) => handleNodeClick(e, node.id)}
                         >
                           <svg
@@ -2310,6 +2484,7 @@ export function App() {
                                 : "次の図形（四角またはひし形）を追加"
                             }
                             onMouseDown={(e) => e.stopPropagation()}
+                            onTouchStart={(e) => e.stopPropagation()}
                             onClick={(e) => {
                               e.stopPropagation();
                               setMergeMode(null);
@@ -2353,10 +2528,14 @@ export function App() {
                   <div
                     className="plus-popover-menu"
                     style={{
-                      left: `${Math.max(20, plusMenu.x - 115)}px`,
+                      left: `${Math.min(
+                        totalCanvasWidth - 260,
+                        Math.max(20, plusMenu.x - 115)
+                      )}px`,
                       top: `${plusMenu.y}px`,
                     }}
                     onMouseDown={(e) => e.stopPropagation()}
+                    onTouchStart={(e) => e.stopPropagation()}
                     onClick={(e) => e.stopPropagation()}
                   >
                     <div className="plus-popover-header">
@@ -2445,6 +2624,7 @@ export function App() {
             <div
               className="undo-toast-bar"
               onMouseDown={(e) => e.stopPropagation()}
+              onTouchStart={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
             >
               <span className="undo-toast-message">🗑 {undoToast.message}</span>
@@ -2453,7 +2633,7 @@ export function App() {
                 className="undo-toast-btn"
                 onClick={handleUndo}
               >
-                ↩ 元に戻す (Ctrl+Z)
+                ↩ 元に戻す
               </button>
               <button
                 type="button"
@@ -2470,8 +2650,9 @@ export function App() {
           <div
             className="floating-zoom-controls"
             onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
-            title="Ctrl + マウスホイールでも拡大・縮小できます"
+            title="Ctrl + マウスホイール、またはピンチ操作でも拡大・縮小できます"
           >
             <button
               type="button"
@@ -2502,10 +2683,19 @@ export function App() {
           </div>
         </div>
 
+        {/* Mobile Backdrop for Bottom Sheet Drawer */}
+        {selectedNode && (
+          <div
+            className="drawer-mobile-backdrop"
+            onClick={() => setSelectedNodeIds([])}
+          />
+        )}
+
         {/* Right Side Drawer (四角 / ひし形 単一選択時に表示) */}
         <aside className={`right-drawer ${selectedNode ? "drawer-open" : ""}`}>
           {selectedNode ? (
             <div className="drawer-content">
+              <div className="drawer-mobile-pill" />
               <div className="drawer-header">
                 <div className="drawer-type-indicator">
                   {selectedNode.type === "rect" ? (
