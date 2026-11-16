@@ -1,5 +1,35 @@
 export type NodeType = "rect" | "diamond";
 
+export type VariableType = "string" | "number" | "boolean";
+
+export interface FlowchartVariable {
+  id: string;
+  name: string;
+  type: VariableType;
+  defaultValue: string | number | boolean;
+}
+
+export type VariableEffectOp = "set" | "add" | "subtract" | "toggle";
+
+export interface VariableEffect {
+  id: string;
+  variableId: string;
+  /**
+   * 操作種別:
+   * - "set": 代入 (=) — string / number / boolean
+   * - "add": 加算 (+=) — number
+   * - "subtract": 減算 (-=) — number
+   * - "toggle": 反転 (!) — boolean
+   */
+  op: VariableEffectOp;
+  value: string | number | boolean;
+  /**
+   * 特定の分岐スロットを進んだ時のみ適用する場合は 0 以上のスロット番号。
+   * null または undefined の場合は、この図形（節・分岐）を通過した時点で適用。
+   */
+  branchSlot?: number | null;
+}
+
 export interface ChapterLane {
   id: string;
   title: string;
@@ -18,6 +48,8 @@ export interface FlowNode {
   isEnd?: boolean;
   /** 分岐先の個数（四角の場合はデフォルト1、ひし形の場合はデフォルト2） */
   branchCount?: number;
+  /** この図形（四角・ひし形）で発生するフラグ・変数の変更リスト */
+  effects?: VariableEffect[];
 }
 
 export interface FlowEdge {
@@ -36,6 +68,8 @@ export interface FlowchartData {
   chapters: ChapterLane[];
   nodes: FlowNode[];
   edges: FlowEdge[];
+  /** プロジェクト内で定義されたフラグ・変数一覧 */
+  variables?: FlowchartVariable[];
   updatedAt?: string;
 }
 

@@ -4,6 +4,26 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
   return {
     id,
     name,
+    variables: [
+      {
+        id: "var-san",
+        name: "SAN",
+        type: "number",
+        defaultValue: 100,
+      },
+      {
+        id: "var-key",
+        name: "銀の鍵所持",
+        type: "boolean",
+        defaultValue: false,
+      },
+      {
+        id: "var-route",
+        name: "現在ルート",
+        type: "string",
+        defaultValue: "エントランス",
+      },
+    ],
     chapters: [
       {
         id: "chap-1",
@@ -34,6 +54,7 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         y: 85,
         isEnd: false,
         branchCount: 1,
+        effects: [],
       },
       {
         id: "node-2",
@@ -43,6 +64,29 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         x: 520,
         y: 235,
         branchCount: 2,
+        effects: [
+          {
+            id: "eff-branch-left",
+            variableId: "var-route",
+            op: "set",
+            value: "書斎ルート",
+            branchSlot: 0,
+          },
+          {
+            id: "eff-branch-right",
+            variableId: "var-route",
+            op: "set",
+            value: "地下室ルート",
+            branchSlot: 1,
+          },
+          {
+            id: "eff-branch-right-san",
+            variableId: "var-san",
+            op: "subtract",
+            value: 20,
+            branchSlot: 1,
+          },
+        ],
       },
       {
         id: "node-3",
@@ -53,6 +97,15 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         y: 440,
         isEnd: false,
         branchCount: 1,
+        effects: [
+          {
+            id: "eff-get-key",
+            variableId: "var-key",
+            op: "set",
+            value: true,
+            branchSlot: null,
+          },
+        ],
       },
       {
         id: "node-4",
@@ -63,6 +116,15 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         y: 440,
         isEnd: false,
         branchCount: 1,
+        effects: [
+          {
+            id: "eff-basement-san",
+            variableId: "var-san",
+            op: "subtract",
+            value: 15,
+            branchSlot: null,
+          },
+        ],
       },
       {
         id: "node-5",
@@ -72,6 +134,7 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         x: 330,
         y: 605,
         branchCount: 2,
+        effects: [],
       },
       {
         id: "node-6",
@@ -82,6 +145,15 @@ export function createInitialFlowchart(id = "default", name = "サンプルノ�
         y: 820,
         isEnd: true,
         branchCount: 1,
+        effects: [
+          {
+            id: "eff-true-end",
+            variableId: "var-route",
+            op: "set",
+            value: "TRUE END（生還）",
+            branchSlot: null,
+          },
+        ],
       },
     ],
     edges: [
@@ -128,6 +200,7 @@ export function createMinimalFlowchart(id: string, name: string): FlowchartData 
   return {
     id,
     name,
+    variables: [],
     chapters: [
       {
         id: "chap-1",

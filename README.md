@@ -22,6 +22,12 @@ A lightweight, interactive flowchart editor designed for planning visual novels 
   - Attach condition labels (e.g., `"When SAN <= 80"`, `"Has Silver Key"`) directly onto connecting lines by clicking any line on the canvas or editing within the right-side drawer.
 - **Branch Merging**
   - Connect any `+` slot to an existing node on the canvas to merge branching routes back together.
+- **Flag & Variable Management (`🚩 Variables`)**
+  - Define project-wide flags and variables with a **Variable Name**, **Type (`string` | `number` | `boolean`)**, and **Default Value (`defaultValue`)**.
+  - Inside any Rectangle (Section) or Diamond (Branch), define variable mutations (`=` set, `+=` add, `-=` subtract, `!` toggle) applied either upon passing the shape or when choosing a specific branch slot.
+- **Interactive Route Trace & Variable Inspector Mode (`🧭 Route Trace`)**
+  - Visually highlight the traversed route (`STEP 1` → `STEP 2` → ...) and connecting lines on the canvas while dimming unvisited branches.
+  - Interactively pick branches at diamonds/sections (via canvas nodes, lines, or panel buttons), view live calculated variable values and step-by-step change history along the chosen route, and tap any visited step to rewind and test alternate routes.
 - **Smart Hierarchical Auto-Sort**
   - One-click **Auto-Sort (`⇄`)** arranges nodes into hierarchical layers while inserting virtual pass-through lanes and obstacle-avoiding curves so skip-level connections never hide behind intermediate shapes.
 - **Multi-Selection & Group Dragging**

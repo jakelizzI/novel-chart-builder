@@ -1,5 +1,13 @@
 import { createInitialFlowchart } from "./defaultData";
-import type { ChapterLane, FlowchartData, FlowEdge, FlowNode, ProjectSummary } from "./types";
+import type {
+  ChapterLane,
+  FlowchartData,
+  FlowchartVariable,
+  FlowEdge,
+  FlowNode,
+  ProjectSummary,
+  VariableEffect,
+} from "./types";
 
 interface D1PreparedStatement {
   bind(...values: unknown[]): D1PreparedStatement;
@@ -334,6 +342,15 @@ async function authenticateRequest(request: Request, env: Env): Promise<AuthResu
 
 let schemaInitialized = false;
 
+function safeParseJson<T>(raw: string | null | undefined, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 async function ensureSchema(db: D1Database): Promise<void> {
   if (schemaInitialized) return;
   await db.batch([
@@ -341,6 +358,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
+        variables_json TEXT NOT NULL DEFAULT '[]',
         updated_at TEXT NOT NULL
       )
     `),
@@ -365,6 +383,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
         y REAL NOT NULL,
         is_end INTEGER NOT NULL DEFAULT 0,
         branch_count INTEGER NOT NULL DEFAULT 1,
+        effects_json TEXT NOT NULL DEFAULT '[]',
         PRIMARY KEY (project_id, id)
       )
     `),
@@ -380,6 +399,23 @@ async function ensureSchema(db: D1Database): Promise<void> {
       )
     `),
   ]);
+
+  // Safe auto-migrations for existing D1 tables created before variables_json / effects_json
+  try {
+    await db
+      .prepare("ALTER TABLE projects ADD COLUMN variables_json TEXT NOT NULL DEFAULT '[]'")
+      .run();
+  } catch {
+    // Column already exists
+  }
+  try {
+    await db
+      .prepare("ALTER TABLE nodes ADD COLUMN effects_json TEXT NOT NULL DEFAULT '[]'")
+      .run();
+  } catch {
+    // Column already exists
+  }
+
   schemaInitialized = true;
 }
 
@@ -388,11 +424,14 @@ async function saveFlowchartD1(db: D1Database, data: FlowchartData): Promise<Flo
   const statements: D1PreparedStatement[] = [
     db
       .prepare(
-        `INSERT INTO projects (id, name, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`
+        `INSERT INTO projects (id, name, variables_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           variables_json = excluded.variables_json,
+           updated_at = excluded.updated_at`
       )
-      .bind(data.id, data.name, now),
+      .bind(data.id, data.name, JSON.stringify(data.variables ?? []), now),
     db.prepare("DELETE FROM chapters WHERE project_id = ?").bind(data.id),
     db.prepare("DELETE FROM nodes WHERE project_id = ?").bind(data.id),
     db.prepare("DELETE FROM edges WHERE project_id = ?").bind(data.id),
@@ -413,7 +452,7 @@ async function saveFlowchartD1(db: D1Database, data: FlowchartData): Promise<Flo
     statements.push(
       db
         .prepare(
-          "INSERT INTO nodes (id, project_id, type, title, content, x, y, is_end, branch_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO nodes (id, project_id, type, title, content, x, y, is_end, branch_count, effects_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(
           node.id,
@@ -424,7 +463,8 @@ async function saveFlowchartD1(db: D1Database, data: FlowchartData): Promise<Flo
           node.x,
           node.y,
           node.type === "rect" && node.isEnd ? 1 : 0,
-          node.branchCount ?? (node.type === "diamond" ? 2 : 1)
+          node.branchCount ?? (node.type === "diamond" ? 2 : 1),
+          JSON.stringify(node.effects ?? [])
         )
     );
   }
@@ -452,9 +492,11 @@ async function saveFlowchartD1(db: D1Database, data: FlowchartData): Promise<Flo
 
 async function getFlowchartD1(db: D1Database, projectId: string): Promise<FlowchartData | null> {
   const project = await db
-    .prepare("SELECT id, name, updated_at as updatedAt FROM projects WHERE id = ?")
+    .prepare(
+      "SELECT id, name, variables_json, updated_at as updatedAt FROM projects WHERE id = ?"
+    )
     .bind(projectId)
-    .first<ProjectSummary>();
+    .first<ProjectSummary & { variables_json?: string }>();
 
   if (!project) {
     if (projectId === "default") {
@@ -473,7 +515,7 @@ async function getFlowchartD1(db: D1Database, projectId: string): Promise<Flowch
 
   const nodeRes = await db
     .prepare(
-      "SELECT id, type, title, content, x, y, is_end, branch_count FROM nodes WHERE project_id = ?"
+      "SELECT id, type, title, content, x, y, is_end, branch_count, effects_json FROM nodes WHERE project_id = ?"
     )
     .bind(projectId)
     .all<{
@@ -485,6 +527,7 @@ async function getFlowchartD1(db: D1Database, projectId: string): Promise<Flowch
       y: number;
       is_end: number;
       branch_count: number;
+      effects_json?: string;
     }>();
 
   const nodes: FlowNode[] = nodeRes.results.map((r) => ({
@@ -496,6 +539,7 @@ async function getFlowchartD1(db: D1Database, projectId: string): Promise<Flowch
     y: r.y,
     ...(r.type === "rect" ? { isEnd: Boolean(r.is_end) } : {}),
     branchCount: r.branch_count ?? (r.type === "diamond" ? 2 : 1),
+    effects: safeParseJson<VariableEffect[]>(r.effects_json, []),
   }));
 
   const edgeRes = await db
@@ -509,6 +553,7 @@ async function getFlowchartD1(db: D1Database, projectId: string): Promise<Flowch
     id: project.id,
     name: project.name,
     updatedAt: project.updatedAt,
+    variables: safeParseJson<FlowchartVariable[]>(project.variables_json, []),
     chapters: chapterRes.results,
     nodes,
     edges: edgeRes.results,

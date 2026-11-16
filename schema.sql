@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
+  variables_json TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL
 );
 
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   y REAL NOT NULL,
   is_end INTEGER NOT NULL DEFAULT 0,
   branch_count INTEGER NOT NULL DEFAULT 1,
+  effects_json TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (project_id, id),
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );

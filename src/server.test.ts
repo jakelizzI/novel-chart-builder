@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  advanceRouteUntilBranch,
   cloneFlowchart,
   deleteNodesFromChart,
+  evaluateRouteVariables,
   moveNodesInChart,
   sortFlowchartLayout,
 } from "./App";
@@ -140,5 +142,63 @@ describe("SQLite Flowchart Persistence & Auto-Sort Layout", () => {
     const n4Clamped = clamped.nodes.find((n) => n.id === "node-4")!;
     expect(n4Clamped.x - n3Clamped.x).toBe(origDeltaX);
     expect(n4Clamped.y - n3Clamped.y).toBe(origDeltaY);
+  });
+
+  test("persists variables (string, number, boolean) and evaluates route variable changes across branches", () => {
+    const testId = "test-vars-route";
+    const chart = createInitialFlowchart(testId, "変数・ルート検証企画");
+
+    saveFlowchart(chart);
+    const loaded = getFlowchart(testId)!;
+    expect(loaded).not.toBeNull();
+    expect(loaded.variables?.length).toBe(3);
+
+    // 1. Start at node-1: auto-advances to first diamond (node-2)
+    const step1 = advanceRouteUntilBranch(loaded, ["node-1"], []);
+    expect(step1.nodeIds).toEqual(["node-1", "node-2"]);
+    expect(step1.edgeIds).toEqual(["edge-1"]);
+
+    // 2. Choose Branch 0 (edge-2: 左の扉へ -> node-3 -> auto-advances to node-5)
+    const afterLeftBranch = advanceRouteUntilBranch(
+      loaded,
+      [...step1.nodeIds, "node-3"],
+      [...step1.edgeIds, "edge-2"]
+    );
+    expect(afterLeftBranch.nodeIds).toEqual(["node-1", "node-2", "node-3", "node-5"]);
+    expect(afterLeftBranch.edgeIds).toEqual(["edge-1", "edge-2", "edge-4"]);
+
+    const evalLeft = evaluateRouteVariables(
+      loaded,
+      afterLeftBranch.nodeIds,
+      afterLeftBranch.edgeIds
+    );
+    const keyVar = evalLeft.variableStates.find((v) => v.variable.id === "var-key")!;
+    const routeVar = evalLeft.variableStates.find((v) => v.variable.id === "var-route")!;
+    const sanVar = evalLeft.variableStates.find((v) => v.variable.id === "var-san")!;
+    expect(keyVar.currentValue).toBe(true);
+    expect(keyVar.isChanged).toBe(true);
+    expect(routeVar.currentValue).toBe("書斎ルート");
+    expect(sanVar.currentValue).toBe(100);
+
+    // 3. Alternatively, from step1 choose Branch 1 (edge-3: 右の扉へ -> node-4)
+    const afterRightBranch = advanceRouteUntilBranch(
+      loaded,
+      [...step1.nodeIds, "node-4"],
+      [...step1.edgeIds, "edge-3"]
+    );
+    const evalRight = evaluateRouteVariables(
+      loaded,
+      afterRightBranch.nodeIds,
+      afterRightBranch.edgeIds
+    );
+    const sanRight = evalRight.variableStates.find((v) => v.variable.id === "var-san")!;
+    const routeRight = evalRight.variableStates.find((v) => v.variable.id === "var-route")!;
+    const keyRight = evalRight.variableStates.find((v) => v.variable.id === "var-key")!;
+    // Branch 1 on node-2 subtracts 20, and entering node-4 subtracts 15 => 100 - 20 - 15 = 65
+    expect(sanRight.currentValue).toBe(65);
+    expect(routeRight.currentValue).toBe("地下室ルート");
+    expect(keyRight.currentValue).toBe(false);
+
+    deleteProject(testId);
   });
 });

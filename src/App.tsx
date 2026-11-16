@@ -3,10 +3,14 @@ import { createInitialFlowchart, createMinimalFlowchart } from "./defaultData";
 import type {
   ChapterLane,
   FlowchartData,
+  FlowchartVariable,
   FlowEdge,
   FlowNode,
   NodeType,
   ProjectSummary,
+  VariableEffect,
+  VariableEffectOp,
+  VariableType,
 } from "./types";
 
 const RECT_WIDTH = 210;
@@ -44,6 +48,30 @@ interface MarqueeSelectionState {
   hasDragged: boolean;
 }
 
+export interface VariableChangeLogItem {
+  stepIndex: number;
+  nodeId: string;
+  nodeTitle: string;
+  variableId: string;
+  variableName: string;
+  prevValue: string | number | boolean;
+  nextValue: string | number | boolean;
+  op: VariableEffectOp;
+  branchSlot?: number | null;
+}
+
+export interface EvaluatedVariableState {
+  variable: FlowchartVariable;
+  currentValue: string | number | boolean;
+  isChanged: boolean;
+  history: VariableChangeLogItem[];
+}
+
+export interface RouteEvaluationResult {
+  variableStates: EvaluatedVariableState[];
+  stepChanges: Map<number, VariableChangeLogItem[]>;
+}
+
 function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
@@ -55,10 +83,214 @@ function clampZoom(z: number): number {
 export function cloneFlowchart(chart: FlowchartData): FlowchartData {
   return {
     ...chart,
+    variables: (chart.variables ?? []).map((v) => ({ ...v })),
     chapters: chart.chapters.map((c) => ({ ...c })),
-    nodes: chart.nodes.map((n) => ({ ...n })),
+    nodes: chart.nodes.map((n) => ({
+      ...n,
+      effects: (n.effects ?? []).map((eff) => ({ ...eff })),
+    })),
     edges: chart.edges.map((e) => ({ ...e })),
   };
+}
+
+export function applyVariableEffect(
+  varDef: FlowchartVariable,
+  currentVal: string | number | boolean,
+  eff: VariableEffect
+): string | number | boolean {
+  if (varDef.type === "number") {
+    const curr = Number(currentVal) || 0;
+    const operand = Number(eff.value) || 0;
+    if (eff.op === "add") return curr + operand;
+    if (eff.op === "subtract") return curr - operand;
+    return operand;
+  }
+  if (varDef.type === "boolean") {
+    if (eff.op === "toggle") return !Boolean(currentVal);
+    return eff.value === true || eff.value === "true";
+  }
+  return String(eff.value ?? "");
+}
+
+export function formatEffectSummary(
+  eff: VariableEffect,
+  varDef: FlowchartVariable | undefined
+): string {
+  const varName = varDef?.name || "未設定変数";
+  const prefix =
+    eff.branchSlot !== null && eff.branchSlot !== undefined
+      ? `[分岐${eff.branchSlot + 1}] `
+      : "";
+  if (eff.op === "add") {
+    return `${prefix}${varName} +${eff.value}`;
+  }
+  if (eff.op === "subtract") {
+    return `${prefix}${varName} -${eff.value}`;
+  }
+  if (eff.op === "toggle") {
+    return `${prefix}${varName} 反転`;
+  }
+  return `${prefix}${varName} = ${String(eff.value)}`;
+}
+
+export function evaluateRouteVariables(
+  chart: FlowchartData,
+  routeNodeIds: string[],
+  routeEdgeIds: string[]
+): RouteEvaluationResult {
+  const variables = chart.variables ?? [];
+  const varMap = new Map<string, FlowchartVariable>();
+  const currentValues = new Map<string, string | number | boolean>();
+  const historyByVar = new Map<string, VariableChangeLogItem[]>();
+
+  for (const v of variables) {
+    varMap.set(v.id, v);
+    currentValues.set(v.id, v.defaultValue);
+    historyByVar.set(v.id, []);
+  }
+
+  const nodeMap = new Map<string, FlowNode>();
+  for (const n of chart.nodes) {
+    nodeMap.set(n.id, n);
+  }
+
+  const edgeMap = new Map<string, FlowEdge>();
+  for (const e of chart.edges) {
+    edgeMap.set(e.id, e);
+  }
+
+  const stepChanges = new Map<number, VariableChangeLogItem[]>();
+
+  for (let i = 0; i < routeNodeIds.length; i++) {
+    const nodeId = routeNodeIds[i]!;
+    const node = nodeMap.get(nodeId);
+    if (!node) continue;
+
+    const outgoingEdge = i < routeEdgeIds.length ? edgeMap.get(routeEdgeIds[i]!) : undefined;
+    const chosenSlot =
+      outgoingEdge && outgoingEdge.sourceId === node.id ? outgoingEdge.sourceSlot : null;
+
+    const nodeEffects = node.effects ?? [];
+    const changesAtStep: VariableChangeLogItem[] = [];
+
+    for (const eff of nodeEffects) {
+      const isNodeLevel = eff.branchSlot === null || eff.branchSlot === undefined;
+      const isChosenBranchLevel =
+        !isNodeLevel && chosenSlot !== null && eff.branchSlot === chosenSlot;
+
+      if (!isNodeLevel && !isChosenBranchLevel) continue;
+
+      const varDef = varMap.get(eff.variableId);
+      if (!varDef) continue;
+
+      const prevValue = currentValues.get(varDef.id) ?? varDef.defaultValue;
+      const nextValue = applyVariableEffect(varDef, prevValue, eff);
+      currentValues.set(varDef.id, nextValue);
+
+      const logItem: VariableChangeLogItem = {
+        stepIndex: i,
+        nodeId: node.id,
+        nodeTitle: node.title || "（無題）",
+        variableId: varDef.id,
+        variableName: varDef.name,
+        prevValue,
+        nextValue,
+        op: eff.op,
+        branchSlot: eff.branchSlot ?? null,
+      };
+      changesAtStep.push(logItem);
+      historyByVar.get(varDef.id)?.push(logItem);
+    }
+
+    if (changesAtStep.length > 0) {
+      stepChanges.set(i, changesAtStep);
+    }
+  }
+
+  const variableStates: EvaluatedVariableState[] = variables.map((v) => {
+    const currentValue = currentValues.get(v.id) ?? v.defaultValue;
+    return {
+      variable: v,
+      currentValue,
+      isChanged: currentValue !== v.defaultValue,
+      history: historyByVar.get(v.id) ?? [],
+    };
+  });
+
+  return {
+    variableStates,
+    stepChanges,
+  };
+}
+
+export function findDefaultStartNodeId(chart: FlowchartData): string | null {
+  if (chart.nodes.length === 0) return null;
+  const incomingCount = new Map<string, number>();
+  for (const n of chart.nodes) {
+    incomingCount.set(n.id, 0);
+  }
+  for (const e of chart.edges) {
+    if (incomingCount.has(e.targetId) && incomingCount.has(e.sourceId)) {
+      incomingCount.set(e.targetId, (incomingCount.get(e.targetId) ?? 0) + 1);
+    }
+  }
+  const roots = chart.nodes
+    .filter((n) => (incomingCount.get(n.id) ?? 0) === 0)
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+  if (roots.length > 0) {
+    return roots[0]!.id;
+  }
+  const sorted = [...chart.nodes].sort((a, b) => a.y - b.y || a.x - b.x);
+  return sorted[0]?.id ?? null;
+}
+
+export function advanceRouteUntilBranch(
+  chart: FlowchartData,
+  initialNodeIds: string[],
+  initialEdgeIds: string[]
+): { nodeIds: string[]; edgeIds: string[] } {
+  const nodeIds = [...initialNodeIds];
+  const edgeIds = [...initialEdgeIds];
+  if (nodeIds.length === 0) return { nodeIds, edgeIds };
+
+  const nodeMap = new Map<string, FlowNode>();
+  for (const n of chart.nodes) {
+    nodeMap.set(n.id, n);
+  }
+
+  const visitedInAutoAdvance = new Set<string>(nodeIds);
+
+  while (nodeIds.length > 0) {
+    const currentId = nodeIds[nodeIds.length - 1]!;
+    const currentNode = nodeMap.get(currentId);
+    if (!currentNode) break;
+    if (currentNode.type === "rect" && currentNode.isEnd) break;
+
+    const slotCount =
+      currentNode.type === "diamond"
+        ? Math.max(1, currentNode.branchCount ?? 2)
+        : Math.max(1, currentNode.branchCount ?? 1);
+
+    // Stop at any multi-branch node (e.g. diamond or multi-branch rect) so the user can choose the branch!
+    if (slotCount > 1) break;
+
+    const outgoingEdges = chart.edges.filter(
+      (e) =>
+        e.sourceId === currentId &&
+        e.sourceSlot === 0 &&
+        nodeMap.has(e.targetId)
+    );
+    if (outgoingEdges.length !== 1) break;
+
+    const nextEdge = outgoingEdges[0]!;
+    if (visitedInAutoAdvance.has(nextEdge.targetId)) break;
+
+    visitedInAutoAdvance.add(nextEdge.targetId);
+    edgeIds.push(nextEdge.id);
+    nodeIds.push(nextEdge.targetId);
+  }
+
+  return { nodeIds, edgeIds };
 }
 
 export function deleteNodesFromChart(
@@ -599,6 +831,11 @@ export function App() {
   const [mergeMode, setMergeMode] = useState<MergeModeState | null>(null);
   const [marquee, setMarquee] = useState<MarqueeSelectionState | null>(null);
   const [isMultiSelectMode, setIsMultiSelectMode] = useState<boolean>(false);
+  const [showVariableModal, setShowVariableModal] = useState<boolean>(false);
+  const [routeTraceMode, setRouteTraceMode] = useState<boolean>(false);
+  const [routeNodeIds, setRouteNodeIds] = useState<string[]>([]);
+  const [routeEdgeIds, setRouteEdgeIds] = useState<string[]>([]);
+  const [routeDrawerMinimized, setRouteDrawerMinimized] = useState<boolean>(false);
   const [zoom, setZoom] = useState<number>(() =>
     typeof window !== "undefined" && window.innerWidth <= 768 ? 0.8 : 1.0
   );
@@ -938,11 +1175,285 @@ export function App() {
 
   const selectedNodeSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds]);
 
-  // Right Drawer opens only when a single node is selected
+  // Right Drawer opens only when a single node is selected (and not in Route Trace Mode)
   const selectedNode = useMemo(
-    () => (selectedNodeIds.length === 1 ? nodeMap.get(selectedNodeIds[0]!) ?? null : null),
-    [selectedNodeIds, nodeMap]
+    () =>
+      !routeTraceMode && selectedNodeIds.length === 1
+        ? nodeMap.get(selectedNodeIds[0]!) ?? null
+        : null,
+    [routeTraceMode, selectedNodeIds, nodeMap]
   );
+
+  const variableMap = useMemo(() => {
+    const map = new Map<string, FlowchartVariable>();
+    for (const v of chart.variables ?? []) {
+      map.set(v.id, v);
+    }
+    return map;
+  }, [chart.variables]);
+
+  // Route Trace computed state
+  const routeStepIndexMap = useMemo(() => {
+    const map = new Map<string, number>();
+    routeNodeIds.forEach((id, idx) => {
+      map.set(id, idx);
+    });
+    return map;
+  }, [routeNodeIds]);
+
+  const routeEdgeSet = useMemo(() => new Set(routeEdgeIds), [routeEdgeIds]);
+
+  const currentRouteNodeId =
+    routeNodeIds.length > 0 ? routeNodeIds[routeNodeIds.length - 1]! : null;
+  const currentRouteNode = currentRouteNodeId ? nodeMap.get(currentRouteNodeId) ?? null : null;
+
+  const nextRouteBranchEdges = useMemo(() => {
+    if (!routeTraceMode || !currentRouteNode) return [];
+    if (currentRouteNode.type === "rect" && currentRouteNode.isEnd) return [];
+    const slotCount = getNodeSlotCount(currentRouteNode);
+    return chart.edges
+      .filter(
+        (e) =>
+          e.sourceId === currentRouteNode.id &&
+          e.sourceSlot >= 0 &&
+          e.sourceSlot < slotCount &&
+          nodeMap.has(e.targetId)
+      )
+      .sort((a, b) => a.sourceSlot - b.sourceSlot);
+  }, [routeTraceMode, currentRouteNode, chart.edges, nodeMap]);
+
+  const nextBranchEdgeByTargetId = useMemo(() => {
+    const map = new Map<string, FlowEdge>();
+    for (const e of nextRouteBranchEdges) {
+      if (!map.has(e.targetId)) {
+        map.set(e.targetId, e);
+      }
+    }
+    return map;
+  }, [nextRouteBranchEdges]);
+
+  const nextBranchEdgeSet = useMemo(
+    () => new Set(nextRouteBranchEdges.map((e) => e.id)),
+    [nextRouteBranchEdges]
+  );
+
+  const routeEvaluation = useMemo(
+    () => evaluateRouteVariables(chart, routeNodeIds, routeEdgeIds),
+    [chart, routeNodeIds, routeEdgeIds]
+  );
+
+  // Start or toggle Route Trace Mode
+  function handleStartRouteFromNode(startNodeId: string) {
+    const advanced = advanceRouteUntilBranch(chart, [startNodeId], []);
+    setRouteNodeIds(advanced.nodeIds);
+    setRouteEdgeIds(advanced.edgeIds);
+    setRouteDrawerMinimized(false);
+  }
+
+  function handleToggleRouteTraceMode() {
+    if (routeTraceMode) {
+      setRouteTraceMode(false);
+      return;
+    }
+    const startId =
+      (selectedNodeIds.length === 1 && nodeMap.has(selectedNodeIds[0]!)
+        ? selectedNodeIds[0]!
+        : null) ?? findDefaultStartNodeId(chart);
+    setRouteTraceMode(true);
+    setIsMultiSelectMode(false);
+    setMergeMode(null);
+    setPlusMenu(null);
+    setSelectedEdgeId(null);
+    setSelectedNodeIds([]);
+    setRouteDrawerMinimized(false);
+    if (startId) {
+      const advanced = advanceRouteUntilBranch(chart, [startId], []);
+      setRouteNodeIds(advanced.nodeIds);
+      setRouteEdgeIds(advanced.edgeIds);
+    } else {
+      setRouteNodeIds([]);
+      setRouteEdgeIds([]);
+    }
+  }
+
+  function handleChooseRouteBranch(edge: FlowEdge) {
+    const nextNodes = [...routeNodeIds, edge.targetId];
+    const nextEdges = [...routeEdgeIds, edge.id];
+    const advanced = advanceRouteUntilBranch(chart, nextNodes, nextEdges);
+    setRouteNodeIds(advanced.nodeIds);
+    setRouteEdgeIds(advanced.edgeIds);
+  }
+
+  function handleRewindRouteToStep(stepIdx: number) {
+    if (stepIdx < 0 || stepIdx >= routeNodeIds.length) return;
+    setRouteNodeIds(routeNodeIds.slice(0, stepIdx + 1));
+    setRouteEdgeIds(routeEdgeIds.slice(0, stepIdx));
+  }
+
+  function handleResetRouteTrace() {
+    const startId = routeNodeIds[0] ?? findDefaultStartNodeId(chart);
+    if (startId && nodeMap.has(startId)) {
+      handleStartRouteFromNode(startId);
+    } else {
+      const fallback = findDefaultStartNodeId(chart);
+      if (fallback) handleStartRouteFromNode(fallback);
+    }
+  }
+
+  // Variable & Flag CRUD
+  function handleAddVariable() {
+    pushUndoSnapshot(chart);
+    const existingCount = (chart.variables ?? []).length + 1;
+    const newVar: FlowchartVariable = {
+      id: uid("var"),
+      name: `flag_${existingCount}`,
+      type: "boolean",
+      defaultValue: false,
+    };
+    setChart((prev) => ({
+      ...prev,
+      variables: [...(prev.variables ?? []), newVar],
+    }));
+  }
+
+  function handleUpdateVariable(varId: string, patch: Partial<FlowchartVariable>) {
+    setChart((prev) => {
+      const nextVars = (prev.variables ?? []).map((v) => {
+        if (v.id !== varId) return v;
+        const updated: FlowchartVariable = { ...v, ...patch };
+        if (patch.type && patch.type !== v.type && patch.defaultValue === undefined) {
+          updated.defaultValue =
+            patch.type === "number" ? 0 : patch.type === "boolean" ? false : "";
+        }
+        return updated;
+      });
+
+      // If variable type changed, normalize any effects referencing it
+      let nextNodes = prev.nodes;
+      if (patch.type) {
+        const newType = patch.type;
+        nextNodes = prev.nodes.map((n) => {
+          if (!n.effects || n.effects.length === 0) return n;
+          return {
+            ...n,
+            effects: n.effects.map((eff) => {
+              if (eff.variableId !== varId) return eff;
+              const nextOp: VariableEffectOp =
+                newType === "number"
+                  ? eff.op === "add" || eff.op === "subtract"
+                    ? eff.op
+                    : "set"
+                  : newType === "boolean"
+                    ? eff.op === "toggle"
+                      ? "toggle"
+                      : "set"
+                    : "set";
+              const nextVal =
+                newType === "number"
+                  ? Number(eff.value) || 0
+                  : newType === "boolean"
+                    ? Boolean(eff.value)
+                    : String(eff.value ?? "");
+              return { ...eff, op: nextOp, value: nextVal };
+            }),
+          };
+        });
+      }
+
+      return {
+        ...prev,
+        variables: nextVars,
+        nodes: nextNodes,
+      };
+    });
+  }
+
+  function handleDeleteVariable(varId: string) {
+    pushUndoSnapshot(chart);
+    setChart((prev) => ({
+      ...prev,
+      variables: (prev.variables ?? []).filter((v) => v.id !== varId),
+      nodes: prev.nodes.map((n) => ({
+        ...n,
+        effects: (n.effects ?? []).filter((eff) => eff.variableId !== varId),
+      })),
+    }));
+  }
+
+  // Node Variable Effect CRUD
+  function handleAddNodeEffect(nodeId: string, branchSlot: number | null = null) {
+    const vars = chart.variables ?? [];
+    if (vars.length === 0) {
+      setShowVariableModal(true);
+      return;
+    }
+    pushUndoSnapshot(chart);
+    const firstVar = vars[0]!;
+    const newEff: VariableEffect = {
+      id: uid("eff"),
+      variableId: firstVar.id,
+      op: "set",
+      value:
+        firstVar.type === "number"
+          ? 0
+          : firstVar.type === "boolean"
+            ? true
+            : "",
+      branchSlot,
+    };
+    setChart((prev) => ({
+      ...prev,
+      nodes: prev.nodes.map((n) =>
+        n.id === nodeId ? { ...n, effects: [...(n.effects ?? []), newEff] } : n
+      ),
+    }));
+  }
+
+  function handleUpdateNodeEffect(
+    nodeId: string,
+    effectId: string,
+    patch: Partial<VariableEffect>
+  ) {
+    setChart((prev) => ({
+      ...prev,
+      nodes: prev.nodes.map((n) => {
+        if (n.id !== nodeId) return n;
+        return {
+          ...n,
+          effects: (n.effects ?? []).map((eff) => {
+            if (eff.id !== effectId) return eff;
+            const nextEff = { ...eff, ...patch };
+            // If variableId changed, coerce op and value to match the target variable's type
+            if (patch.variableId && patch.variableId !== eff.variableId) {
+              const targetVar = variableMap.get(patch.variableId);
+              if (targetVar) {
+                nextEff.op = "set";
+                nextEff.value =
+                  targetVar.type === "number"
+                    ? 0
+                    : targetVar.type === "boolean"
+                      ? true
+                      : "";
+              }
+            }
+            return nextEff;
+          }),
+        };
+      }),
+    }));
+  }
+
+  function handleDeleteNodeEffect(nodeId: string, effectId: string) {
+    pushUndoSnapshot(chart);
+    setChart((prev) => ({
+      ...prev,
+      nodes: prev.nodes.map((n) =>
+        n.id === nodeId
+          ? { ...n, effects: (n.effects ?? []).filter((eff) => eff.id !== effectId) }
+          : n
+      ),
+    }));
+  }
 
   // Bulk or single delete with Undo snapshot & Toast notification
   function handleDeleteNodes(targetIds: string[]) {
@@ -1140,6 +1651,10 @@ export function App() {
     if (e.button !== 0) return;
     e.stopPropagation();
 
+    if (routeTraceMode) {
+      return;
+    }
+
     if (mergeMode) {
       if (mergeMode.sourceId !== node.id) {
         handleConnectToExistingNode(mergeMode.sourceId, mergeMode.sourceSlot, node.id);
@@ -1158,6 +1673,10 @@ export function App() {
   function handleNodeTouchStart(e: React.TouchEvent, node: FlowNode) {
     if (e.touches.length !== 1) return;
     e.stopPropagation();
+
+    if (routeTraceMode) {
+      return;
+    }
 
     if (mergeMode) {
       if (mergeMode.sourceId !== node.id) {
@@ -1657,10 +2176,25 @@ export function App() {
     setSelectedNodeIds([newId]);
   }
 
-  // Handle clicking or Ctrl+clicking a node (or tapping when Multi-Select Mode is ON)
+  // Handle clicking or Ctrl+clicking a node (or selecting a branch / rewinding in Route Trace Mode)
   function handleNodeClick(e: React.MouseEvent, nodeId: string) {
     e.stopPropagation();
     if (mergeMode) return;
+
+    if (routeTraceMode) {
+      const nextChoiceEdge = nextBranchEdgeByTargetId.get(nodeId);
+      if (nextChoiceEdge) {
+        handleChooseRouteBranch(nextChoiceEdge);
+        return;
+      }
+      const visitedStepIdx = routeStepIndexMap.get(nodeId);
+      if (visitedStepIdx !== undefined) {
+        handleRewindRouteToStep(visitedStepIdx);
+        return;
+      }
+      handleStartRouteFromNode(nodeId);
+      return;
+    }
 
     // If the user just finished dragging a node or group, keep the selection intact!
     if (suppressClickAfterDragRef.current) {
@@ -1834,8 +2368,27 @@ export function App() {
           </button>
           <button
             type="button"
+            className={`btn ${routeTraceMode ? "btn-route-active" : "btn-secondary"}`}
+            onClick={handleToggleRouteTraceMode}
+            title="辿ってきたルートをハイライトし、分岐を選択しながら変数・フラグの変化を確認します"
+          >
+            {routeTraceMode ? "🧭 ルート確認中 (ON)" : "🧭 ルート確認モード"}
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => setShowVariableModal(true)}
+            title="プロジェクト全体のフラグ・変数（string / number / boolean と初期値）を管理します"
+          >
+            🚩 変数・フラグ ({(chart.variables ?? []).length})
+          </button>
+          <button
+            type="button"
             className={`btn ${isMultiSelectMode ? "btn-primary" : "btn-secondary"}`}
-            onClick={() => setIsMultiSelectMode((prev) => !prev)}
+            onClick={() => {
+              setRouteTraceMode(false);
+              setIsMultiSelectMode((prev) => !prev);
+            }}
             title="複数選択モードのON/OFF（スマホ・タブレットでもタップやドラッグで複数選択できます）"
           >
             {isMultiSelectMode ? "☑ 複数選択ON" : "☐ 複数選択"}
@@ -1922,6 +2475,44 @@ export function App() {
               }}
             >
               選択解除
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Route Trace / Simulation Mode Banner */}
+      {routeTraceMode && (
+        <div className="route-trace-banner">
+          <div className="route-trace-banner-info">
+            <span className="route-trace-badge">
+              🧭 ルート確認モード（{routeNodeIds.length} ステップ通過中）
+            </span>
+            <span className="route-trace-hint">
+              オレンジ色の分岐先またはパネルの選択肢をタップして進行 ／ 通過済みの緑色図形をタップでその時点へ巻き戻し
+            </span>
+          </div>
+          <div className="route-trace-banner-actions">
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={handleResetRouteTrace}
+              title="最初の開始ノードからルート確認をやり直します"
+            >
+              ↺ 最初から
+            </button>
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={() => setRouteDrawerMinimized((prev) => !prev)}
+            >
+              {routeDrawerMinimized ? "📊 変数・分岐パネルを開く" : "パネルを隠す"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={() => setRouteTraceMode(false)}
+            >
+              通常編集に戻る
             </button>
           </div>
         </div>
@@ -2180,6 +2771,28 @@ export function App() {
                     >
                       <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb" />
                     </marker>
+                    <marker
+                      id="arrow-route"
+                      viewBox="0 0 10 10"
+                      refX="8"
+                      refY="5"
+                      markerWidth="7"
+                      markerHeight="7"
+                      orient="auto-start-reverse"
+                    >
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669" />
+                    </marker>
+                    <marker
+                      id="arrow-route-choice"
+                      viewBox="0 0 10 10"
+                      refX="8"
+                      refY="5"
+                      markerWidth="7"
+                      markerHeight="7"
+                      orient="auto-start-reverse"
+                    >
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706" />
+                    </marker>
                   </defs>
 
                   {/* 2a. Stems from each node to its circular (+) buttons */}
@@ -2229,14 +2842,32 @@ export function App() {
                     );
 
                     const isSelected = selectedEdgeId === edge.id;
+                    const isRouteTraversed = routeTraceMode && routeEdgeSet.has(edge.id);
+                    const isRouteChoice = routeTraceMode && nextBranchEdgeSet.has(edge.id);
+                    const isRouteDimmed =
+                      routeTraceMode && !isRouteTraversed && !isRouteChoice;
 
                     return (
                       <g
                         key={edge.id}
-                        className="edge-group"
+                        className={`edge-group ${
+                          isRouteTraversed
+                            ? "edge-route-traversed"
+                            : isRouteChoice
+                              ? "edge-route-choice"
+                              : isRouteDimmed
+                                ? "edge-route-dimmed"
+                                : ""
+                        }`}
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
+                          if (routeTraceMode) {
+                            if (isRouteChoice) {
+                              handleChooseRouteBranch(edge);
+                            }
+                            return;
+                          }
                           setSelectedEdgeId(edge.id);
                           setPlusMenu(null);
                         }}
@@ -2245,16 +2876,46 @@ export function App() {
                           d={pathD}
                           fill="none"
                           stroke="transparent"
-                          strokeWidth={16}
+                          strokeWidth={18}
                           style={{ cursor: "pointer" }}
                         />
                         <path
                           d={pathD}
                           fill="none"
-                          stroke={isSelected ? "#2563eb" : "#475569"}
-                          strokeWidth={isSelected ? 3.2 : 2.2}
+                          className={
+                            isRouteTraversed
+                              ? "edge-path-route-active"
+                              : isRouteChoice
+                                ? "edge-path-route-choice"
+                                : ""
+                          }
+                          stroke={
+                            isRouteTraversed
+                              ? "#059669"
+                              : isRouteChoice
+                                ? "#d97706"
+                                : isSelected
+                                  ? "#2563eb"
+                                  : "#475569"
+                          }
+                          strokeWidth={
+                            isRouteTraversed
+                              ? 4.5
+                              : isRouteChoice
+                                ? 3.5
+                                : isSelected
+                                  ? 3.2
+                                  : 2.2
+                          }
+                          strokeDasharray={isRouteChoice ? "7 5" : undefined}
                           markerEnd={
-                            isSelected ? "url(#arrow-selected)" : "url(#arrow-normal)"
+                            isRouteTraversed
+                              ? "url(#arrow-route)"
+                              : isRouteChoice
+                                ? "url(#arrow-route-choice)"
+                                : isSelected
+                                  ? "url(#arrow-selected)"
+                                  : "url(#arrow-normal)"
                           }
                           style={{ cursor: "pointer" }}
                         />
@@ -2277,9 +2938,11 @@ export function App() {
                     chart.nodes
                   );
                   const hasLabel = Boolean(edge.label && edge.label.trim().length > 0);
-                  const isSelected = selectedEdgeId === edge.id;
+                  const isSelected = !routeTraceMode && selectedEdgeId === edge.id;
+                  const isRouteChoice = routeTraceMode && nextBranchEdgeSet.has(edge.id);
+                  const isRouteTraversed = routeTraceMode && routeEdgeSet.has(edge.id);
 
-                  if (!hasLabel && !isSelected) return null;
+                  if (!hasLabel && !isSelected && !isRouteChoice) return null;
 
                   return (
                     <div
@@ -2294,6 +2957,12 @@ export function App() {
                       onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => {
                         e.stopPropagation();
+                        if (routeTraceMode) {
+                          if (isRouteChoice) {
+                            handleChooseRouteBranch(edge);
+                          }
+                          return;
+                        }
                         setSelectedEdgeId(edge.id);
                         setPlusMenu(null);
                       }}
@@ -2345,10 +3014,24 @@ export function App() {
                         </div>
                       ) : (
                         <div
-                          className="edge-comment-pill"
-                          title="クリックして線のコメントを編集"
+                          className={`edge-comment-pill ${
+                            isRouteTraversed
+                              ? "edge-pill-route-traversed"
+                              : isRouteChoice
+                                ? "edge-pill-route-choice"
+                                : ""
+                          }`}
+                          title={
+                            isRouteChoice
+                              ? "タップしてこの分岐ルートを選択"
+                              : "クリックして線のコメントを編集"
+                          }
                         >
-                          {edge.label}
+                          {isRouteChoice
+                            ? `👉 分岐${edge.sourceSlot + 1}${
+                                edge.label ? `: ${edge.label}` : " を選択"
+                              }`
+                            : edge.label}
                         </div>
                       )}
                     </div>
@@ -2364,6 +3047,20 @@ export function App() {
                   const branchState = getNodeBranchState(node);
                   const slotCount = branchState.branchCount;
 
+                  const visitedStepIdx = routeTraceMode
+                    ? routeStepIndexMap.get(node.id)
+                    : undefined;
+                  const isRouteVisited = visitedStepIdx !== undefined;
+                  const isRouteCurrent = routeTraceMode && currentRouteNodeId === node.id;
+                  const nextChoiceEdge = routeTraceMode
+                    ? nextBranchEdgeByTargetId.get(node.id)
+                    : undefined;
+                  const isRouteNextChoice = Boolean(nextChoiceEdge);
+                  const isRouteDimmed =
+                    routeTraceMode && !isRouteVisited && !isRouteNextChoice;
+
+                  const nodeEffects = node.effects ?? [];
+
                   return (
                     <React.Fragment key={node.id}>
                       {/* Shape Body (Rectangle or Diamond) */}
@@ -2373,7 +3070,11 @@ export function App() {
                             isSelected ? "node-selected" : ""
                           } ${isMultiSelected ? "node-multi-selected" : ""} ${
                             node.isEnd ? "rect-node-end" : ""
-                          } ${isMergeCandidate ? "node-merge-target" : ""}`}
+                          } ${isMergeCandidate ? "node-merge-target" : ""} ${
+                            isRouteVisited ? "node-route-visited" : ""
+                          } ${isRouteCurrent ? "node-route-current" : ""} ${
+                            isRouteNextChoice ? "node-route-next-choice" : ""
+                          } ${isRouteDimmed ? "node-route-dimmed" : ""}`}
                           style={{
                             left: `${node.x - RECT_WIDTH / 2}px`,
                             top: `${node.y - RECT_HEIGHT / 2}px`,
@@ -2384,6 +3085,35 @@ export function App() {
                           onTouchStart={(e) => handleNodeTouchStart(e, node)}
                           onClick={(e) => handleNodeClick(e, node.id)}
                         >
+                          {isRouteVisited && (
+                            <div
+                              className={`route-step-floating-badge ${
+                                isRouteCurrent ? "route-step-current" : ""
+                              }`}
+                            >
+                              STEP {visitedStepIdx + 1}
+                              {isRouteCurrent ? "（現在地）" : ""}
+                            </div>
+                          )}
+                          {isRouteNextChoice && nextChoiceEdge && (
+                            <div className="route-choice-floating-badge">
+                              👉 分岐 {nextChoiceEdge.sourceSlot + 1} を選択
+                            </div>
+                          )}
+                          {nodeEffects.length > 0 && (
+                            <div className="node-effects-floating-strip">
+                              {nodeEffects.slice(0, 2).map((eff) => (
+                                <span key={eff.id} className="node-effect-mini-chip">
+                                  ⚡ {formatEffectSummary(eff, variableMap.get(eff.variableId))}
+                                </span>
+                              ))}
+                              {nodeEffects.length > 2 && (
+                                <span className="node-effect-mini-chip">
+                                  +{nodeEffects.length - 2}
+                                </span>
+                              )}
+                            </div>
+                          )}
                           <div className="rect-node-header">
                             <span className="node-kind-tag">
                               {!node.isEnd && slotCount > 1
@@ -2408,7 +3138,11 @@ export function App() {
                               : "diamond-complete"
                           } ${isSelected ? "node-selected" : ""} ${
                             isMultiSelected ? "node-multi-selected" : ""
-                          } ${isMergeCandidate ? "node-merge-target" : ""}`}
+                          } ${isMergeCandidate ? "node-merge-target" : ""} ${
+                            isRouteVisited ? "node-route-visited" : ""
+                          } ${isRouteCurrent ? "node-route-current" : ""} ${
+                            isRouteNextChoice ? "node-route-next-choice" : ""
+                          } ${isRouteDimmed ? "node-route-dimmed" : ""}`}
                           style={{
                             left: `${node.x - DIAMOND_WIDTH / 2}px`,
                             top: `${node.y - DIAMOND_HEIGHT / 2}px`,
@@ -2419,6 +3153,35 @@ export function App() {
                           onTouchStart={(e) => handleNodeTouchStart(e, node)}
                           onClick={(e) => handleNodeClick(e, node.id)}
                         >
+                          {isRouteVisited && (
+                            <div
+                              className={`route-step-floating-badge ${
+                                isRouteCurrent ? "route-step-current" : ""
+                              }`}
+                            >
+                              STEP {visitedStepIdx + 1}
+                              {isRouteCurrent ? "（現在地・分岐選択）" : ""}
+                            </div>
+                          )}
+                          {isRouteNextChoice && nextChoiceEdge && (
+                            <div className="route-choice-floating-badge">
+                              👉 分岐 {nextChoiceEdge.sourceSlot + 1} を選択
+                            </div>
+                          )}
+                          {nodeEffects.length > 0 && (
+                            <div className="node-effects-floating-strip diamond-effects-strip">
+                              {nodeEffects.slice(0, 2).map((eff) => (
+                                <span key={eff.id} className="node-effect-mini-chip">
+                                  ⚡ {formatEffectSummary(eff, variableMap.get(eff.variableId))}
+                                </span>
+                              ))}
+                              {nodeEffects.length > 2 && (
+                                <span className="node-effect-mini-chip">
+                                  +{nodeEffects.length - 2}
+                                </span>
+                              )}
+                            </div>
+                          )}
                           <svg
                             className="diamond-shape-svg"
                             viewBox={`0 0 ${DIAMOND_WIDTH} ${DIAMOND_HEIGHT}`}
@@ -2684,16 +3447,291 @@ export function App() {
         </div>
 
         {/* Mobile Backdrop for Bottom Sheet Drawer */}
-        {selectedNode && (
+        {(selectedNode || (routeTraceMode && !routeDrawerMinimized)) && (
           <div
             className="drawer-mobile-backdrop"
-            onClick={() => setSelectedNodeIds([])}
+            onClick={() => {
+              if (routeTraceMode) {
+                setRouteDrawerMinimized(true);
+              } else {
+                setSelectedNodeIds([]);
+              }
+            }}
           />
         )}
 
-        {/* Right Side Drawer (四角 / ひし形 単一選択時に表示) */}
-        <aside className={`right-drawer ${selectedNode ? "drawer-open" : ""}`}>
-          {selectedNode ? (
+        {/* Right Side Drawer (単一図形選択時 または ルート確認モード時に表示) */}
+        <aside
+          className={`right-drawer ${
+            selectedNode || (routeTraceMode && !routeDrawerMinimized) ? "drawer-open" : ""
+          }`}
+        >
+          {routeTraceMode && !routeDrawerMinimized ? (
+            <div className="drawer-content">
+              <div className="drawer-mobile-pill" />
+              <div className="drawer-header route-drawer-header">
+                <div className="drawer-type-indicator">
+                  <span className="drawer-badge badge-route">
+                    🧭 ルート確認 &amp; 変数ステータス
+                  </span>
+                  <span className="drawer-chapter-tag">
+                    現在 {routeNodeIds.length} ステップ通過中
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                  <button
+                    type="button"
+                    className="btn btn-small"
+                    onClick={handleResetRouteTrace}
+                    title="最初の開始ノードからやり直す"
+                  >
+                    ↺ リセット
+                  </button>
+                  <button
+                    type="button"
+                    className="drawer-close-btn"
+                    onClick={() => setRouteDrawerMinimized(true)}
+                    title="パネルを隠す"
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+
+              <div className="drawer-body">
+                {/* 1. 辿ってきたルートによる変数の現在値 */}
+                <div className="route-section-box">
+                  <div className="route-section-header">
+                    <span className="form-label">📊 現在の変数・フラグ値</span>
+                    <button
+                      type="button"
+                      className="btn-link-inline"
+                      onClick={() => setShowVariableModal(true)}
+                    >
+                      変数定義を編集
+                    </button>
+                  </div>
+
+                  {routeEvaluation.variableStates.length === 0 ? (
+                    <div className="connection-empty-note">
+                      変数がまだ定義されていません。上部の「🚩 変数・フラグ」から追加できます。
+                    </div>
+                  ) : (
+                    <div className="route-var-list">
+                      {routeEvaluation.variableStates.map((vs) => (
+                        <div
+                          key={vs.variable.id}
+                          className={`route-var-card ${
+                            vs.isChanged ? "route-var-changed" : ""
+                          }`}
+                        >
+                          <div className="route-var-top-row">
+                            <div className="route-var-name-group">
+                              <span className="route-var-name">{vs.variable.name}</span>
+                              <span className="route-var-type-tag">
+                                {vs.variable.type}
+                              </span>
+                            </div>
+                            <div className="route-var-val-group">
+                              {vs.isChanged && (
+                                <span className="route-var-default">
+                                  初期: {String(vs.variable.defaultValue)} →
+                                </span>
+                              )}
+                              <span
+                                className={`route-var-current ${
+                                  vs.isChanged ? "route-var-current-highlight" : ""
+                                }`}
+                              >
+                                {String(vs.currentValue)}
+                              </span>
+                            </div>
+                          </div>
+                          {vs.history.length > 0 && (
+                            <div className="route-var-history">
+                              {vs.history.map((h, i) => (
+                                <span key={i} className="route-var-history-chip">
+                                  STEP {h.stepIndex + 1} ({h.nodeTitle}):{" "}
+                                  {String(h.prevValue)} →{" "}
+                                  <strong>{String(h.nextValue)}</strong>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* 2. 現在の地点からの分岐選択 */}
+                <div className="route-section-box route-branch-choice-box">
+                  <div className="form-label">
+                    🔀 次のルート（分岐）を選択
+                  </div>
+                  {currentRouteNode ? (
+                    <>
+                      <div className="route-current-node-summary">
+                        <span className="route-current-step-tag">
+                          現在地: STEP {routeNodeIds.length}
+                        </span>
+                        <strong>{currentRouteNode.title || "（無題）"}</strong>
+                        {currentRouteNode.content && (
+                          <p className="route-current-node-text">
+                            {currentRouteNode.content}
+                          </p>
+                        )}
+                      </div>
+
+                      {currentRouteNode.type === "rect" && currentRouteNode.isEnd ? (
+                        <div className="route-end-reached-box">
+                          🏁 <strong>END（物語の終端）に到達しました！</strong>
+                          <span>
+                            下の通過ルート履歴やキャンバス上の図形をタップすると、途中の分岐まで巻き戻して別ルートを試せます。
+                          </span>
+                        </div>
+                      ) : nextRouteBranchEdges.length === 0 ? (
+                        <div className="connection-empty-note">
+                          この図形から先に接続されている図形がありません。
+                        </div>
+                      ) : (
+                        <div className="route-branch-buttons-list">
+                          {nextRouteBranchEdges.map((edge) => {
+                            const target = nodeMap.get(edge.targetId);
+                            const branchEffects = (
+                              currentRouteNode.effects ?? []
+                            ).filter((eff) => eff.branchSlot === edge.sourceSlot);
+                            const targetNodeEffects = (target?.effects ?? []).filter(
+                              (eff) =>
+                                eff.branchSlot === null || eff.branchSlot === undefined
+                            );
+                            const previewEffects = [
+                              ...branchEffects,
+                              ...targetNodeEffects,
+                            ];
+
+                            return (
+                              <button
+                                key={edge.id}
+                                type="button"
+                                className="route-branch-choice-btn"
+                                onClick={() => handleChooseRouteBranch(edge)}
+                              >
+                                <div className="route-branch-choice-top">
+                                  <span className="route-branch-slot-pill">
+                                    分岐 {edge.sourceSlot + 1}
+                                  </span>
+                                  {edge.label && (
+                                    <span className="route-branch-edge-label">
+                                      {edge.label}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="route-branch-target-title">
+                                  → {target?.title || "（無題）"} へ進む
+                                </div>
+                                {previewEffects.length > 0 && (
+                                  <div className="route-branch-effects-preview">
+                                    {previewEffects.map((eff) => (
+                                      <span
+                                        key={eff.id}
+                                        className="node-effect-mini-chip"
+                                      >
+                                        ⚡{" "}
+                                        {formatEffectSummary(
+                                          eff,
+                                          variableMap.get(eff.variableId)
+                                        )}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="connection-empty-note">
+                      キャンバス上の図形をタップして開始地点を選択してください。
+                    </div>
+                  )}
+                </div>
+
+                {/* 3. 辿ってきたルート履歴（ステップ一覧・巻き戻し対応） */}
+                <div className="route-section-box">
+                  <div className="form-label">
+                    👣 辿ってきたルート履歴（タップでその時点へ巻き戻し）
+                  </div>
+                  <div className="route-steps-timeline">
+                    {routeNodeIds.map((nodeId, idx) => {
+                      const n = nodeMap.get(nodeId);
+                      if (!n) return null;
+                      const changes = routeEvaluation.stepChanges.get(idx) ?? [];
+                      const isCurrent = idx === routeNodeIds.length - 1;
+                      const incomingEdge =
+                        idx > 0
+                          ? chart.edges.find((e) => e.id === routeEdgeIds[idx - 1])
+                          : null;
+
+                      return (
+                        <div
+                          key={`${nodeId}-${idx}`}
+                          className={`route-timeline-item ${
+                            isCurrent ? "route-timeline-current" : ""
+                          }`}
+                          onClick={() => handleRewindRouteToStep(idx)}
+                          title="クリックするとこのステップの時点までルートを巻き戻します"
+                        >
+                          <div className="route-timeline-header">
+                            <span className="route-timeline-step-num">
+                              STEP {idx + 1}
+                            </span>
+                            <span className="route-timeline-node-kind">
+                              {n.type === "rect" ? "□ 節" : "◇ 分岐"}
+                            </span>
+                            <strong className="route-timeline-node-title">
+                              {n.title || "（無題）"}
+                            </strong>
+                          </div>
+                          {incomingEdge?.label && (
+                            <div className="route-timeline-via-edge">
+                              ↳ 選択条件: 「{incomingEdge.label}」
+                            </div>
+                          )}
+                          {changes.length > 0 && (
+                            <div className="route-timeline-changes">
+                              {changes.map((c, cIdx) => (
+                                <span
+                                  key={cIdx}
+                                  className="route-timeline-change-pill"
+                                >
+                                  ⚡ {c.variableName}: {String(c.prevValue)} →{" "}
+                                  <strong>{String(c.nextValue)}</strong>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="drawer-footer">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ width: "100%" }}
+                  onClick={() => setRouteTraceMode(false)}
+                >
+                  ルート確認モードを終了して編集に戻る
+                </button>
+              </div>
+            </div>
+          ) : selectedNode ? (
             <div className="drawer-content">
               <div className="drawer-mobile-pill" />
               <div className="drawer-header">
@@ -2849,6 +3887,196 @@ export function App() {
                   </div>
                 )}
 
+                {/* 3C. フラグ・変数の変更設定（四角・ひし形共通） */}
+                <div className="form-group special-box effects-special-box">
+                  <div className="route-section-header">
+                    <label className="form-label">
+                      ⚡ フラグ・変数の変更（この図形での値の変化）
+                    </label>
+                    <button
+                      type="button"
+                      className="btn-link-inline"
+                      onClick={() => setShowVariableModal(true)}
+                    >
+                      ＋変数定義を管理
+                    </button>
+                  </div>
+
+                  {(chart.variables ?? []).length === 0 ? (
+                    <div className="connection-empty-note">
+                      まず「＋変数定義を管理」からフラグ・変数（string / number / boolean）を登録してください。
+                    </div>
+                  ) : (
+                    <>
+                      {(selectedNode.effects ?? []).length === 0 ? (
+                        <div className="connection-empty-note">
+                          この図形での変数変更は設定されていません。
+                        </div>
+                      ) : (
+                        <div className="node-effects-editor-list">
+                          {(selectedNode.effects ?? []).map((eff) => {
+                            const targetVar = variableMap.get(eff.variableId);
+                            const varType: VariableType = targetVar?.type ?? "string";
+                            const slotCount = getNodeSlotCount(selectedNode);
+
+                            return (
+                              <div key={eff.id} className="node-effect-editor-card">
+                                <div className="node-effect-editor-row">
+                                  {/* 複数分岐がある場合は「図形通過時」か「特定の分岐選択時」を選べる */}
+                                  {slotCount > 1 && (
+                                    <select
+                                      className="effect-timing-select"
+                                      value={
+                                        eff.branchSlot === null ||
+                                        eff.branchSlot === undefined
+                                          ? "node"
+                                          : String(eff.branchSlot)
+                                      }
+                                      onChange={(e) =>
+                                        handleUpdateNodeEffect(
+                                          selectedNode.id,
+                                          eff.id,
+                                          {
+                                            branchSlot:
+                                              e.target.value === "node"
+                                                ? null
+                                                : Number.parseInt(e.target.value, 10),
+                                          }
+                                        )
+                                      }
+                                      title="いつ変数を変更するか"
+                                    >
+                                      <option value="node">この図形を通過時</option>
+                                      {Array.from({ length: slotCount }, (_, sIdx) => (
+                                        <option key={sIdx} value={String(sIdx)}>
+                                          分岐 {sIdx + 1} を選択時
+                                        </option>
+                                      ))}
+                                    </select>
+                                  )}
+
+                                  {/* 変数選択 */}
+                                  <select
+                                    className="effect-var-select"
+                                    value={eff.variableId}
+                                    onChange={(e) =>
+                                      handleUpdateNodeEffect(selectedNode.id, eff.id, {
+                                        variableId: e.target.value,
+                                      })
+                                    }
+                                  >
+                                    {(chart.variables ?? []).map((v) => (
+                                      <option key={v.id} value={v.id}>
+                                        {v.name} ({v.type})
+                                      </option>
+                                    ))}
+                                  </select>
+
+                                  <button
+                                    type="button"
+                                    className="slot-unlink-btn"
+                                    onClick={() =>
+                                      handleDeleteNodeEffect(selectedNode.id, eff.id)
+                                    }
+                                    title="この変更設定を削除"
+                                  >
+                                    削除
+                                  </button>
+                                </div>
+
+                                <div className="node-effect-editor-row">
+                                  {/* 操作（=, +=, -=, 反転） */}
+                                  <select
+                                    className="effect-op-select"
+                                    value={eff.op}
+                                    onChange={(e) =>
+                                      handleUpdateNodeEffect(selectedNode.id, eff.id, {
+                                        op: e.target.value as VariableEffectOp,
+                                      })
+                                    }
+                                  >
+                                    <option value="set">= （代入する）</option>
+                                    {varType === "number" && (
+                                      <>
+                                        <option value="add">+= （加算する）</option>
+                                        <option value="subtract">-= （減算する）</option>
+                                      </>
+                                    )}
+                                    {varType === "boolean" && (
+                                      <option value="toggle">! （ON/OFF反転）</option>
+                                    )}
+                                  </select>
+
+                                  {/* 変更値の入力（型に応じる） */}
+                                  {eff.op !== "toggle" &&
+                                    (varType === "boolean" ? (
+                                      <select
+                                        className="effect-val-input"
+                                        value={String(Boolean(eff.value))}
+                                        onChange={(e) =>
+                                          handleUpdateNodeEffect(
+                                            selectedNode.id,
+                                            eff.id,
+                                            {
+                                              value: e.target.value === "true",
+                                            }
+                                          )
+                                        }
+                                      >
+                                        <option value="true">true (ON)</option>
+                                        <option value="false">false (OFF)</option>
+                                      </select>
+                                    ) : varType === "number" ? (
+                                      <input
+                                        type="number"
+                                        className="effect-val-input"
+                                        value={Number(eff.value) || 0}
+                                        onChange={(e) =>
+                                          handleUpdateNodeEffect(
+                                            selectedNode.id,
+                                            eff.id,
+                                            {
+                                              value: Number(e.target.value) || 0,
+                                            }
+                                          )
+                                        }
+                                      />
+                                    ) : (
+                                      <input
+                                        type="text"
+                                        className="effect-val-input"
+                                        value={String(eff.value ?? "")}
+                                        placeholder="変更後の文字列..."
+                                        onChange={(e) =>
+                                          handleUpdateNodeEffect(
+                                            selectedNode.id,
+                                            eff.id,
+                                            {
+                                              value: e.target.value,
+                                            }
+                                          )
+                                        }
+                                      />
+                                    ))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        style={{ width: "100%", marginTop: "4px" }}
+                        onClick={() => handleAddNodeEffect(selectedNode.id, null)}
+                      >
+                        ＋ この図形で変数の変更を追加
+                      </button>
+                    </>
+                  )}
+                </div>
+
                 {/* 4. 下流への接続状況 ＆ 分岐線のコメント入力 */}
                 <div className="drawer-connections-section">
                   <div className="form-label">
@@ -2937,6 +4165,154 @@ export function App() {
           ) : null}
         </aside>
       </div>
+
+      {/* Variable & Flag Manager Modal (変数・フラグ定義モーダル) */}
+      {showVariableModal && (
+        <div
+          className="var-modal-backdrop"
+          onClick={() => setShowVariableModal(false)}
+        >
+          <div
+            className="var-modal-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="var-modal-header">
+              <div>
+                <h2 className="var-modal-title">🚩 フラグ・変数の定義管理</h2>
+                <p className="var-modal-subtitle">
+                  変数名・型（string / number / boolean）・初期値（defaultValue）を定義します。
+                </p>
+              </div>
+              <button
+                type="button"
+                className="drawer-close-btn"
+                onClick={() => setShowVariableModal(false)}
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="var-modal-body">
+              {(chart.variables ?? []).length === 0 ? (
+                <div className="connection-empty-note">
+                  まだ変数が登録されていません。「＋ 新しい変数を追加」ボタンを押して作成してください。
+                </div>
+              ) : (
+                <div className="var-def-list">
+                  {(chart.variables ?? []).map((v) => (
+                    <div key={v.id} className="var-def-row">
+                      <div className="var-def-field">
+                        <label>変数名</label>
+                        <input
+                          type="text"
+                          className="form-input"
+                          value={v.name}
+                          placeholder="例: SAN, hasKey"
+                          onChange={(e) =>
+                            handleUpdateVariable(v.id, { name: e.target.value })
+                          }
+                        />
+                      </div>
+
+                      <div className="var-def-field var-def-type-field">
+                        <label>型 (Type)</label>
+                        <select
+                          className="form-input"
+                          value={v.type}
+                          onChange={(e) => {
+                            const nextType = e.target.value as VariableType;
+                            const defaultVal =
+                              nextType === "number"
+                                ? 0
+                                : nextType === "boolean"
+                                  ? false
+                                  : "";
+                            handleUpdateVariable(v.id, {
+                              type: nextType,
+                              defaultValue: defaultVal,
+                            });
+                          }}
+                        >
+                          <option value="boolean">boolean (真偽値)</option>
+                          <option value="number">number (数値)</option>
+                          <option value="string">string (文字列)</option>
+                        </select>
+                      </div>
+
+                      <div className="var-def-field">
+                        <label>初期値 (defaultValue)</label>
+                        {v.type === "boolean" ? (
+                          <select
+                            className="form-input"
+                            value={String(Boolean(v.defaultValue))}
+                            onChange={(e) =>
+                              handleUpdateVariable(v.id, {
+                                defaultValue: e.target.value === "true",
+                              })
+                            }
+                          >
+                            <option value="false">false (OFF)</option>
+                            <option value="true">true (ON)</option>
+                          </select>
+                        ) : v.type === "number" ? (
+                          <input
+                            type="number"
+                            className="form-input"
+                            value={Number(v.defaultValue) || 0}
+                            onChange={(e) =>
+                              handleUpdateVariable(v.id, {
+                                defaultValue: Number(e.target.value) || 0,
+                              })
+                            }
+                          />
+                        ) : (
+                          <input
+                            type="text"
+                            className="form-input"
+                            value={String(v.defaultValue ?? "")}
+                            placeholder="初期文字列..."
+                            onChange={(e) =>
+                              handleUpdateVariable(v.id, {
+                                defaultValue: e.target.value,
+                              })
+                            }
+                          />
+                        )}
+                      </div>
+
+                      <button
+                        type="button"
+                        className="slot-unlink-btn var-def-delete-btn"
+                        onClick={() => handleDeleteVariable(v.id)}
+                        title="この変数を削除"
+                      >
+                        削除
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="var-modal-footer">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleAddVariable}
+              >
+                ＋ 新しい変数を追加
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setShowVariableModal(false)}
+              >
+                完了
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
