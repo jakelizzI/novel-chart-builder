@@ -1965,6 +1965,35 @@ body,
   color: #92400e;
 }
 
+.edge-pill-route-switchable {
+  background: #eef2ff;
+  border: 2px solid #4f46e5;
+  color: #3730a3;
+  font-weight: 800;
+  box-shadow: 0 3px 10px rgba(79, 70, 229, 0.2);
+}
+
+.edge-pill-route-switchable:hover {
+  background: #e0e7ff;
+  border-color: #4338ca;
+  color: #312e81;
+}
+
+.edge-badge-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+
+.edge-effects-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 3px;
+}
+
 /* Node Route States */
 .flow-node.node-route-dimmed {
   opacity: 0.35;
@@ -1989,6 +2018,13 @@ body,
   cursor: pointer;
 }
 
+.rect-node.node-route-switchable {
+  border-color: #4f46e5;
+  background: #eef2ff;
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.28), 0 5px 14px rgba(79, 70, 229, 0.15);
+  cursor: pointer;
+}
+
 .diamond-node.node-route-visited .diamond-polygon {
   fill: #d1fae5;
   stroke: #059669;
@@ -2005,6 +2041,12 @@ body,
   fill: #fef3c7;
   stroke: #d97706;
   stroke-width: 3.6;
+}
+
+.diamond-node.node-route-switchable .diamond-polygon {
+  fill: #e0e7ff;
+  stroke: #4f46e5;
+  stroke-width: 3.4;
 }
 
 /* Floating Step Badge & Choice Badge on Nodes */
@@ -2030,7 +2072,8 @@ body,
 }
 
 .diamond-node .route-step-floating-badge,
-.diamond-node .route-choice-floating-badge {
+.diamond-node .route-choice-floating-badge,
+.diamond-node .route-switch-floating-badge {
   left: 50%;
   transform: translateX(-50%);
   top: -18px;
@@ -2048,6 +2091,22 @@ body,
   border-radius: 999px;
   white-space: nowrap;
   box-shadow: 0 3px 8px rgba(217, 119, 6, 0.35);
+  z-index: 20;
+  pointer-events: none;
+}
+
+.route-switch-floating-badge {
+  position: absolute;
+  top: -23px;
+  left: 0;
+  background: #4f46e5;
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  box-shadow: 0 3px 8px rgba(79, 70, 229, 0.3);
   z-index: 20;
   pointer-events: none;
 }
@@ -2394,6 +2453,82 @@ body,
   border: 1px solid #fde68a;
   padding: 1px 6px;
   border-radius: 4px;
+}
+
+/* Inline Branch Switcher inside Route Timeline */
+.route-inline-branch-switcher {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 4px;
+  padding: 7px 8px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: 6px;
+}
+
+.route-inline-switcher-label {
+  font-size: 10.5px;
+  font-weight: 800;
+  color: #4f46e5;
+}
+
+.route-inline-switcher-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.route-switch-pill {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 9px;
+  border-radius: 6px;
+  border: 1px solid #a5b4fc;
+  background: #eef2ff;
+  color: #3730a3;
+  cursor: pointer;
+  transition: all 0.14s;
+}
+
+.route-switch-pill:hover {
+  background: #e0e7ff;
+  border-color: #6366f1;
+}
+
+.route-switch-pill.active {
+  background: #059669;
+  border-color: #047857;
+  color: #ffffff;
+}
+
+/* Branch Slot Effects inside Connections Section */
+.slot-branch-effects-area {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed #cbd5e1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.slot-branch-effects-header {
+  font-size: 11px;
+  font-weight: 700;
+  color: #92400e;
+}
+
+.slot-add-effect-btn {
+  width: 100%;
+  font-size: 11.5px;
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #92400e;
+}
+
+.slot-add-effect-btn:hover {
+  background: #fef3c7;
+  border-color: #f59e0b;
 }
 
 /* Node Effects Editor inside Drawer */

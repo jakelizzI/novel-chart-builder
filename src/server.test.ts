@@ -6,6 +6,7 @@ import {
   evaluateRouteVariables,
   moveNodesInChart,
   sortFlowchartLayout,
+  switchRouteBranchAtStep,
 } from "./App";
 import { deleteProject, getFlowchart, listProjects, saveFlowchart } from "./db";
 import { createInitialFlowchart, createMinimalFlowchart } from "./defaultData";
@@ -198,6 +199,48 @@ describe("SQLite Flowchart Persistence & Auto-Sort Layout", () => {
     expect(sanRight.currentValue).toBe(65);
     expect(routeRight.currentValue).toBe("地下室ルート");
     expect(keyRight.currentValue).toBe(false);
+
+    // 4. Test 1-click intermediate branch switching (A -> B and B -> A) while remembering downstream choices
+    // Suppose user reached final node-6 via Left branch (node-1 -> node-2 -> node-3 -> node-5 -> node-6)
+    const fullLeftNodes = ["node-1", "node-2", "node-3", "node-5", "node-6"];
+    const fullLeftEdges = ["edge-1", "edge-2", "edge-4", "edge-5"];
+
+    // Switch intermediate branch at step 1 (node-2) from edge-2 (Left) to edge-3 (Right)
+    const edgeRight = loaded.edges.find((e) => e.id === "edge-3")!;
+    const switchedToRight = switchRouteBranchAtStep(
+      loaded,
+      fullLeftNodes,
+      fullLeftEdges,
+      1,
+      edgeRight,
+      {}
+    );
+    expect(switchedToRight.nodeIds).toEqual(["node-1", "node-2", "node-4"]);
+    expect(switchedToRight.edgeIds).toEqual(["edge-1", "edge-3"]);
+
+    // Now switch step 1 (node-2) back to edge-2 (Left): it remembers that node-5 chose slot 0 (edge-5 -> node-6)!
+    const edgeLeft = loaded.edges.find((e) => e.id === "edge-2")!;
+    const switchedBackToLeft = switchRouteBranchAtStep(
+      loaded,
+      switchedToRight.nodeIds,
+      switchedToRight.edgeIds,
+      1,
+      edgeLeft,
+      switchedToRight.updatedChoices
+    );
+    expect(switchedBackToLeft.nodeIds).toEqual([
+      "node-1",
+      "node-2",
+      "node-3",
+      "node-5",
+      "node-6",
+    ]);
+    expect(switchedBackToLeft.edgeIds).toEqual([
+      "edge-1",
+      "edge-2",
+      "edge-4",
+      "edge-5",
+    ]);
 
     deleteProject(testId);
   });

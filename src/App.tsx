@@ -174,9 +174,15 @@ export function evaluateRouteVariables(
     const changesAtStep: VariableChangeLogItem[] = [];
 
     for (const eff of nodeEffects) {
-      const isNodeLevel = eff.branchSlot === null || eff.branchSlot === undefined;
+      // ひし形（分岐）自体には変数処理は無く、選択した分岐（chosenSlot）に対する変更のみ適用
+      const isNodeLevel =
+        node.type === "rect" &&
+        (eff.branchSlot === null || eff.branchSlot === undefined);
       const isChosenBranchLevel =
-        !isNodeLevel && chosenSlot !== null && eff.branchSlot === chosenSlot;
+        eff.branchSlot !== null &&
+        eff.branchSlot !== undefined &&
+        chosenSlot !== null &&
+        eff.branchSlot === chosenSlot;
 
       if (!isNodeLevel && !isChosenBranchLevel) continue;
 
@@ -247,7 +253,8 @@ export function findDefaultStartNodeId(chart: FlowchartData): string | null {
 export function advanceRouteUntilBranch(
   chart: FlowchartData,
   initialNodeIds: string[],
-  initialEdgeIds: string[]
+  initialEdgeIds: string[],
+  preferredChoices?: Readonly<Record<string, number>>
 ): { nodeIds: string[]; edgeIds: string[] } {
   const nodeIds = [...initialNodeIds];
   const edgeIds = [...initialEdgeIds];
@@ -271,8 +278,26 @@ export function advanceRouteUntilBranch(
         ? Math.max(1, currentNode.branchCount ?? 2)
         : Math.max(1, currentNode.branchCount ?? 1);
 
-    // Stop at any multi-branch node (e.g. diamond or multi-branch rect) so the user can choose the branch!
-    if (slotCount > 1) break;
+    if (slotCount > 1) {
+      // If user previously chose a branch at this node (e.g. when switching an earlier branch),
+      // automatically follow that remembered branch choice if it is connected!
+      const preferredSlot = preferredChoices?.[currentId];
+      if (preferredSlot === undefined) break;
+
+      const rememberedEdge = chart.edges.find(
+        (e) =>
+          e.sourceId === currentId &&
+          e.sourceSlot === preferredSlot &&
+          nodeMap.has(e.targetId)
+      );
+      if (!rememberedEdge || visitedInAutoAdvance.has(rememberedEdge.targetId)) {
+        break;
+      }
+      visitedInAutoAdvance.add(rememberedEdge.targetId);
+      edgeIds.push(rememberedEdge.id);
+      nodeIds.push(rememberedEdge.targetId);
+      continue;
+    }
 
     const outgoingEdges = chart.edges.filter(
       (e) =>
@@ -291,6 +316,47 @@ export function advanceRouteUntilBranch(
   }
 
   return { nodeIds, edgeIds };
+}
+
+/**
+ * Switches the branch choice at `stepIdx` (where `routeNodeIds[stepIdx]` is `newEdge.sourceId`)
+ * without requiring the user to start over from the root, while remembering downstream choices.
+ */
+export function switchRouteBranchAtStep(
+  chart: FlowchartData,
+  routeNodeIds: string[],
+  routeEdgeIds: string[],
+  stepIdx: number,
+  newEdge: FlowEdge,
+  existingChoices: Readonly<Record<string, number>> = {}
+): {
+  nodeIds: string[];
+  edgeIds: string[];
+  updatedChoices: Record<string, number>;
+} {
+  const updatedChoices: Record<string, number> = { ...existingChoices };
+  // Record all currently active branch choices along the route first
+  for (let i = 0; i < routeEdgeIds.length && i < routeNodeIds.length; i++) {
+    const e = chart.edges.find((item) => item.id === routeEdgeIds[i]);
+    if (e) {
+      updatedChoices[e.sourceId] = e.sourceSlot;
+    }
+  }
+  // Override the branch choice at stepIdx
+  updatedChoices[newEdge.sourceId] = newEdge.sourceSlot;
+
+  const prefixNodes = routeNodeIds.slice(0, stepIdx + 1);
+  const prefixEdges = routeEdgeIds.slice(0, stepIdx);
+
+  const nextNodes = [...prefixNodes, newEdge.targetId];
+  const nextEdges = [...prefixEdges, newEdge.id];
+
+  const advanced = advanceRouteUntilBranch(chart, nextNodes, nextEdges, updatedChoices);
+  return {
+    nodeIds: advanced.nodeIds,
+    edgeIds: advanced.edgeIds,
+    updatedChoices,
+  };
 }
 
 export function deleteNodesFromChart(
@@ -835,6 +901,9 @@ export function App() {
   const [routeTraceMode, setRouteTraceMode] = useState<boolean>(false);
   const [routeNodeIds, setRouteNodeIds] = useState<string[]>([]);
   const [routeEdgeIds, setRouteEdgeIds] = useState<string[]>([]);
+  const [routeBranchChoices, setRouteBranchChoices] = useState<Record<string, number>>(
+    {}
+  );
   const [routeDrawerMinimized, setRouteDrawerMinimized] = useState<boolean>(false);
   const [zoom, setZoom] = useState<number>(() =>
     typeof window !== "undefined" && window.innerWidth <= 768 ? 0.8 : 1.0
@@ -1237,6 +1306,45 @@ export function App() {
     [nextRouteBranchEdges]
   );
 
+  // Intermediate branch switchers: for any branch node already passed on the route (0 <= stepIdx < routeNodeIds.length - 1),
+  // collect its alternative (unchosen) connected outgoing edges so the user can switch A ⇄ B in 1 click!
+  const switchableBranchByEdgeId = useMemo(() => {
+    const map = new Map<string, { stepIdx: number; edge: FlowEdge }>();
+    if (!routeTraceMode) return map;
+    for (let i = 0; i < routeNodeIds.length - 1; i++) {
+      const nodeId = routeNodeIds[i]!;
+      const node = nodeMap.get(nodeId);
+      if (!node) continue;
+      if (node.type === "rect" && node.isEnd) continue;
+      const slotCount = getNodeSlotCount(node);
+      if (slotCount <= 1) continue;
+
+      const takenEdgeId = routeEdgeIds[i];
+      for (const e of chart.edges) {
+        if (
+          e.sourceId === nodeId &&
+          e.sourceSlot >= 0 &&
+          e.sourceSlot < slotCount &&
+          e.id !== takenEdgeId &&
+          nodeMap.has(e.targetId)
+        ) {
+          map.set(e.id, { stepIdx: i, edge: e });
+        }
+      }
+    }
+    return map;
+  }, [routeTraceMode, routeNodeIds, routeEdgeIds, chart.edges, nodeMap]);
+
+  const switchableBranchByTargetId = useMemo(() => {
+    const map = new Map<string, { stepIdx: number; edge: FlowEdge }>();
+    for (const item of switchableBranchByEdgeId.values()) {
+      if (!map.has(item.edge.targetId) && !routeStepIndexMap.has(item.edge.targetId)) {
+        map.set(item.edge.targetId, item);
+      }
+    }
+    return map;
+  }, [switchableBranchByEdgeId, routeStepIndexMap]);
+
   const routeEvaluation = useMemo(
     () => evaluateRouteVariables(chart, routeNodeIds, routeEdgeIds),
     [chart, routeNodeIds, routeEdgeIds]
@@ -1244,7 +1352,12 @@ export function App() {
 
   // Start or toggle Route Trace Mode
   function handleStartRouteFromNode(startNodeId: string) {
-    const advanced = advanceRouteUntilBranch(chart, [startNodeId], []);
+    const advanced = advanceRouteUntilBranch(
+      chart,
+      [startNodeId],
+      [],
+      routeBranchChoices
+    );
     setRouteNodeIds(advanced.nodeIds);
     setRouteEdgeIds(advanced.edgeIds);
     setRouteDrawerMinimized(false);
@@ -1267,7 +1380,12 @@ export function App() {
     setSelectedNodeIds([]);
     setRouteDrawerMinimized(false);
     if (startId) {
-      const advanced = advanceRouteUntilBranch(chart, [startId], []);
+      const advanced = advanceRouteUntilBranch(
+        chart,
+        [startId],
+        [],
+        routeBranchChoices
+      );
       setRouteNodeIds(advanced.nodeIds);
       setRouteEdgeIds(advanced.edgeIds);
     } else {
@@ -1277,11 +1395,30 @@ export function App() {
   }
 
   function handleChooseRouteBranch(edge: FlowEdge) {
+    const nextChoices = {
+      ...routeBranchChoices,
+      [edge.sourceId]: edge.sourceSlot,
+    };
+    setRouteBranchChoices(nextChoices);
     const nextNodes = [...routeNodeIds, edge.targetId];
     const nextEdges = [...routeEdgeIds, edge.id];
-    const advanced = advanceRouteUntilBranch(chart, nextNodes, nextEdges);
+    const advanced = advanceRouteUntilBranch(chart, nextNodes, nextEdges, nextChoices);
     setRouteNodeIds(advanced.nodeIds);
     setRouteEdgeIds(advanced.edgeIds);
+  }
+
+  function handleSwitchBranchAtStep(stepIdx: number, newEdge: FlowEdge) {
+    const result = switchRouteBranchAtStep(
+      chart,
+      routeNodeIds,
+      routeEdgeIds,
+      stepIdx,
+      newEdge,
+      routeBranchChoices
+    );
+    setRouteBranchChoices(result.updatedChoices);
+    setRouteNodeIds(result.nodeIds);
+    setRouteEdgeIds(result.edgeIds);
   }
 
   function handleRewindRouteToStep(stepIdx: number) {
@@ -1291,12 +1428,14 @@ export function App() {
   }
 
   function handleResetRouteTrace() {
+    setRouteBranchChoices({});
     const startId = routeNodeIds[0] ?? findDefaultStartNodeId(chart);
-    if (startId && nodeMap.has(startId)) {
-      handleStartRouteFromNode(startId);
-    } else {
-      const fallback = findDefaultStartNodeId(chart);
-      if (fallback) handleStartRouteFromNode(fallback);
+    const targetStartId =
+      startId && nodeMap.has(startId) ? startId : findDefaultStartNodeId(chart);
+    if (targetStartId) {
+      const advanced = advanceRouteUntilBranch(chart, [targetStartId], [], {});
+      setRouteNodeIds(advanced.nodeIds);
+      setRouteEdgeIds(advanced.edgeIds);
     }
   }
 
@@ -2031,6 +2170,20 @@ export function App() {
         nextEdges = nextEdges.filter(
           (e) => !(e.sourceId === nodeId && e.sourceSlot >= validCount)
         );
+        for (let i = 0; i < nextNodes.length; i++) {
+          const n = nextNodes[i]!;
+          if (n.id === nodeId && n.effects && n.effects.length > 0) {
+            nextNodes[i] = {
+              ...n,
+              effects: n.effects.filter(
+                (eff) =>
+                  eff.branchSlot === null ||
+                  eff.branchSlot === undefined ||
+                  eff.branchSlot < validCount
+              ),
+            };
+          }
+        }
       }
 
       return {
@@ -2185,6 +2338,11 @@ export function App() {
       const nextChoiceEdge = nextBranchEdgeByTargetId.get(nodeId);
       if (nextChoiceEdge) {
         handleChooseRouteBranch(nextChoiceEdge);
+        return;
+      }
+      const switchableItem = switchableBranchByTargetId.get(nodeId);
+      if (switchableItem) {
+        handleSwitchBranchAtStep(switchableItem.stepIdx, switchableItem.edge);
         return;
       }
       const visitedStepIdx = routeStepIndexMap.get(nodeId);
@@ -2793,6 +2951,17 @@ export function App() {
                     >
                       <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706" />
                     </marker>
+                    <marker
+                      id="arrow-route-switch"
+                      viewBox="0 0 10 10"
+                      refX="8"
+                      refY="5"
+                      markerWidth="7"
+                      markerHeight="7"
+                      orient="auto-start-reverse"
+                    >
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#4f46e5" />
+                    </marker>
                   </defs>
 
                   {/* 2a. Stems from each node to its circular (+) buttons */}
@@ -2844,8 +3013,15 @@ export function App() {
                     const isSelected = selectedEdgeId === edge.id;
                     const isRouteTraversed = routeTraceMode && routeEdgeSet.has(edge.id);
                     const isRouteChoice = routeTraceMode && nextBranchEdgeSet.has(edge.id);
+                    const switchableItem = routeTraceMode
+                      ? switchableBranchByEdgeId.get(edge.id)
+                      : undefined;
+                    const isRouteSwitchable = Boolean(switchableItem);
                     const isRouteDimmed =
-                      routeTraceMode && !isRouteTraversed && !isRouteChoice;
+                      routeTraceMode &&
+                      !isRouteTraversed &&
+                      !isRouteChoice &&
+                      !isRouteSwitchable;
 
                     return (
                       <g
@@ -2855,9 +3031,11 @@ export function App() {
                             ? "edge-route-traversed"
                             : isRouteChoice
                               ? "edge-route-choice"
-                              : isRouteDimmed
-                                ? "edge-route-dimmed"
-                                : ""
+                              : isRouteSwitchable
+                                ? "edge-route-switchable"
+                                : isRouteDimmed
+                                  ? "edge-route-dimmed"
+                                  : ""
                         }`}
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
@@ -2865,6 +3043,11 @@ export function App() {
                           if (routeTraceMode) {
                             if (isRouteChoice) {
                               handleChooseRouteBranch(edge);
+                            } else if (switchableItem) {
+                              handleSwitchBranchAtStep(
+                                switchableItem.stepIdx,
+                                switchableItem.edge
+                              );
                             }
                             return;
                           }
@@ -2887,35 +3070,49 @@ export function App() {
                               ? "edge-path-route-active"
                               : isRouteChoice
                                 ? "edge-path-route-choice"
-                                : ""
+                                : isRouteSwitchable
+                                  ? "edge-path-route-switchable"
+                                  : ""
                           }
                           stroke={
                             isRouteTraversed
                               ? "#059669"
                               : isRouteChoice
                                 ? "#d97706"
-                                : isSelected
-                                  ? "#2563eb"
-                                  : "#475569"
+                                : isRouteSwitchable
+                                  ? "#4f46e5"
+                                  : isSelected
+                                    ? "#2563eb"
+                                    : "#475569"
                           }
                           strokeWidth={
                             isRouteTraversed
                               ? 4.5
                               : isRouteChoice
                                 ? 3.5
-                                : isSelected
+                                : isRouteSwitchable
                                   ? 3.2
-                                  : 2.2
+                                  : isSelected
+                                    ? 3.2
+                                    : 2.2
                           }
-                          strokeDasharray={isRouteChoice ? "7 5" : undefined}
+                          strokeDasharray={
+                            isRouteChoice
+                              ? "7 5"
+                              : isRouteSwitchable
+                                ? "5 4"
+                                : undefined
+                          }
                           markerEnd={
                             isRouteTraversed
                               ? "url(#arrow-route)"
                               : isRouteChoice
                                 ? "url(#arrow-route-choice)"
-                                : isSelected
-                                  ? "url(#arrow-selected)"
-                                  : "url(#arrow-normal)"
+                                : isRouteSwitchable
+                                  ? "url(#arrow-route-switch)"
+                                  : isSelected
+                                    ? "url(#arrow-selected)"
+                                    : "url(#arrow-normal)"
                           }
                           style={{ cursor: "pointer" }}
                         />
@@ -2938,11 +3135,27 @@ export function App() {
                     chart.nodes
                   );
                   const hasLabel = Boolean(edge.label && edge.label.trim().length > 0);
+                  const branchEffects = (sourceNode.effects ?? []).filter(
+                    (eff) => eff.branchSlot === edge.sourceSlot
+                  );
+                  const hasBranchEffects = branchEffects.length > 0;
                   const isSelected = !routeTraceMode && selectedEdgeId === edge.id;
                   const isRouteChoice = routeTraceMode && nextBranchEdgeSet.has(edge.id);
                   const isRouteTraversed = routeTraceMode && routeEdgeSet.has(edge.id);
+                  const switchableItem = routeTraceMode
+                    ? switchableBranchByEdgeId.get(edge.id)
+                    : undefined;
+                  const isRouteSwitchable = Boolean(switchableItem);
 
-                  if (!hasLabel && !isSelected && !isRouteChoice) return null;
+                  if (
+                    !hasLabel &&
+                    !hasBranchEffects &&
+                    !isSelected &&
+                    !isRouteChoice &&
+                    !isRouteSwitchable
+                  ) {
+                    return null;
+                  }
 
                   return (
                     <div
@@ -2960,6 +3173,11 @@ export function App() {
                         if (routeTraceMode) {
                           if (isRouteChoice) {
                             handleChooseRouteBranch(edge);
+                          } else if (switchableItem) {
+                            handleSwitchBranchAtStep(
+                              switchableItem.stepIdx,
+                              switchableItem.edge
+                            );
                           }
                           return;
                         }
@@ -3013,25 +3231,50 @@ export function App() {
                           </button>
                         </div>
                       ) : (
-                        <div
-                          className={`edge-comment-pill ${
-                            isRouteTraversed
-                              ? "edge-pill-route-traversed"
-                              : isRouteChoice
-                                ? "edge-pill-route-choice"
-                                : ""
-                          }`}
-                          title={
-                            isRouteChoice
-                              ? "タップしてこの分岐ルートを選択"
-                              : "クリックして線のコメントを編集"
-                          }
-                        >
-                          {isRouteChoice
-                            ? `👉 分岐${edge.sourceSlot + 1}${
-                                edge.label ? `: ${edge.label}` : " を選択"
-                              }`
-                            : edge.label}
+                        <div className="edge-badge-stack">
+                          {(hasLabel || isRouteChoice || isRouteSwitchable) && (
+                            <div
+                              className={`edge-comment-pill ${
+                                isRouteTraversed
+                                  ? "edge-pill-route-traversed"
+                                  : isRouteChoice
+                                    ? "edge-pill-route-choice"
+                                    : isRouteSwitchable
+                                      ? "edge-pill-route-switchable"
+                                      : ""
+                              }`}
+                              title={
+                                isRouteChoice
+                                  ? "タップしてこの分岐ルートを選択"
+                                  : isRouteSwitchable
+                                    ? "タップして途中の分岐をこのルートへ切り替え"
+                                    : "クリックして線のコメントを編集"
+                              }
+                            >
+                              {isRouteChoice
+                                ? `👉 分岐${edge.sourceSlot + 1}${
+                                    edge.label ? `: ${edge.label}` : " を選択"
+                                  }`
+                                : isRouteSwitchable
+                                  ? `⇄ 分岐${edge.sourceSlot + 1}へ切替${
+                                      edge.label ? `: ${edge.label}` : ""
+                                    }`
+                                  : edge.label}
+                            </div>
+                          )}
+                          {hasBranchEffects && (
+                            <div className="edge-effects-pill-row">
+                              {branchEffects.map((eff) => (
+                                <span key={eff.id} className="node-effect-mini-chip">
+                                  ⚡{" "}
+                                  {formatEffectSummary(
+                                    { ...eff, branchSlot: null },
+                                    variableMap.get(eff.variableId)
+                                  )}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -3056,10 +3299,23 @@ export function App() {
                     ? nextBranchEdgeByTargetId.get(node.id)
                     : undefined;
                   const isRouteNextChoice = Boolean(nextChoiceEdge);
+                  const switchableTargetItem = routeTraceMode
+                    ? switchableBranchByTargetId.get(node.id)
+                    : undefined;
+                  const isRouteSwitchable = Boolean(switchableTargetItem);
                   const isRouteDimmed =
-                    routeTraceMode && !isRouteVisited && !isRouteNextChoice;
+                    routeTraceMode &&
+                    !isRouteVisited &&
+                    !isRouteNextChoice &&
+                    !isRouteSwitchable;
 
-                  const nodeEffects = node.effects ?? [];
+                  // 四角（節）自体に設定された変数変更のみノード上に表示（ひし形の選択肢別変更は各分岐線に表示）
+                  const rectNodeEffects =
+                    node.type === "rect"
+                      ? (node.effects ?? []).filter(
+                          (eff) => eff.branchSlot === null || eff.branchSlot === undefined
+                        )
+                      : [];
 
                   return (
                     <React.Fragment key={node.id}>
@@ -3074,7 +3330,9 @@ export function App() {
                             isRouteVisited ? "node-route-visited" : ""
                           } ${isRouteCurrent ? "node-route-current" : ""} ${
                             isRouteNextChoice ? "node-route-next-choice" : ""
-                          } ${isRouteDimmed ? "node-route-dimmed" : ""}`}
+                          } ${isRouteSwitchable ? "node-route-switchable" : ""} ${
+                            isRouteDimmed ? "node-route-dimmed" : ""
+                          }`}
                           style={{
                             left: `${node.x - RECT_WIDTH / 2}px`,
                             top: `${node.y - RECT_HEIGHT / 2}px`,
@@ -3100,16 +3358,23 @@ export function App() {
                               👉 分岐 {nextChoiceEdge.sourceSlot + 1} を選択
                             </div>
                           )}
-                          {nodeEffects.length > 0 && (
+                          {!isRouteNextChoice &&
+                            isRouteSwitchable &&
+                            switchableTargetItem && (
+                              <div className="route-switch-floating-badge">
+                                ⇄ 分岐 {switchableTargetItem.edge.sourceSlot + 1} へ切替
+                              </div>
+                            )}
+                          {rectNodeEffects.length > 0 && (
                             <div className="node-effects-floating-strip">
-                              {nodeEffects.slice(0, 2).map((eff) => (
+                              {rectNodeEffects.slice(0, 2).map((eff) => (
                                 <span key={eff.id} className="node-effect-mini-chip">
                                   ⚡ {formatEffectSummary(eff, variableMap.get(eff.variableId))}
                                 </span>
                               ))}
-                              {nodeEffects.length > 2 && (
+                              {rectNodeEffects.length > 2 && (
                                 <span className="node-effect-mini-chip">
-                                  +{nodeEffects.length - 2}
+                                  +{rectNodeEffects.length - 2}
                                 </span>
                               )}
                             </div>
@@ -3142,7 +3407,9 @@ export function App() {
                             isRouteVisited ? "node-route-visited" : ""
                           } ${isRouteCurrent ? "node-route-current" : ""} ${
                             isRouteNextChoice ? "node-route-next-choice" : ""
-                          } ${isRouteDimmed ? "node-route-dimmed" : ""}`}
+                          } ${isRouteSwitchable ? "node-route-switchable" : ""} ${
+                            isRouteDimmed ? "node-route-dimmed" : ""
+                          }`}
                           style={{
                             left: `${node.x - DIAMOND_WIDTH / 2}px`,
                             top: `${node.y - DIAMOND_HEIGHT / 2}px`,
@@ -3168,20 +3435,13 @@ export function App() {
                               👉 分岐 {nextChoiceEdge.sourceSlot + 1} を選択
                             </div>
                           )}
-                          {nodeEffects.length > 0 && (
-                            <div className="node-effects-floating-strip diamond-effects-strip">
-                              {nodeEffects.slice(0, 2).map((eff) => (
-                                <span key={eff.id} className="node-effect-mini-chip">
-                                  ⚡ {formatEffectSummary(eff, variableMap.get(eff.variableId))}
-                                </span>
-                              ))}
-                              {nodeEffects.length > 2 && (
-                                <span className="node-effect-mini-chip">
-                                  +{nodeEffects.length - 2}
-                                </span>
-                              )}
-                            </div>
-                          )}
+                          {!isRouteNextChoice &&
+                            isRouteSwitchable &&
+                            switchableTargetItem && (
+                              <div className="route-switch-floating-badge">
+                                ⇄ 分岐 {switchableTargetItem.edge.sourceSlot + 1} へ切替
+                              </div>
+                            )}
                           <svg
                             className="diamond-shape-svg"
                             viewBox={`0 0 ${DIAMOND_WIDTH} ${DIAMOND_HEIGHT}`}
@@ -3659,10 +3919,10 @@ export function App() {
                   )}
                 </div>
 
-                {/* 3. 辿ってきたルート履歴（ステップ一覧・巻き戻し対応） */}
+                {/* 3. 辿ってきたルート履歴 ＆ 途中の分岐A/B切り替え */}
                 <div className="route-section-box">
                   <div className="form-label">
-                    👣 辿ってきたルート履歴（タップでその時点へ巻き戻し）
+                    👣 辿ってきたルート履歴（途中の分岐もワンタップで切替可能）
                   </div>
                   <div className="route-steps-timeline">
                     {routeNodeIds.map((nodeId, idx) => {
@@ -3674,6 +3934,23 @@ export function App() {
                         idx > 0
                           ? chart.edges.find((e) => e.id === routeEdgeIds[idx - 1])
                           : null;
+
+                      // このステップが複数分岐ノードで、すでに次のステップへ進んでいる場合、
+                      // その場で他の選択肢（A/Bなど）へワンタップで切り替えられるボタン群を表示
+                      const nSlotCount = getNodeSlotCount(n);
+                      const branchEdgesAtStep =
+                        idx < routeNodeIds.length - 1 && nSlotCount > 1
+                          ? chart.edges
+                              .filter(
+                                (e) =>
+                                  e.sourceId === n.id &&
+                                  e.sourceSlot >= 0 &&
+                                  e.sourceSlot < nSlotCount &&
+                                  nodeMap.has(e.targetId)
+                              )
+                              .sort((a, b) => a.sourceSlot - b.sourceSlot)
+                          : [];
+                      const takenEdgeIdAtStep = routeEdgeIds[idx];
 
                       return (
                         <div
@@ -3700,6 +3977,50 @@ export function App() {
                               ↳ 選択条件: 「{incomingEdge.label}」
                             </div>
                           )}
+
+                          {/* 途中の分岐（A/B等）をその場で切り替えられるスイッチャー */}
+                          {branchEdgesAtStep.length > 0 && (
+                            <div
+                              className="route-inline-branch-switcher"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <span className="route-inline-switcher-label">
+                                🔀 分岐切替:
+                              </span>
+                              <div className="route-inline-switcher-btns">
+                                {branchEdgesAtStep.map((bEdge) => {
+                                  const isTaken = bEdge.id === takenEdgeIdAtStep;
+                                  const bTarget = nodeMap.get(bEdge.targetId);
+                                  return (
+                                    <button
+                                      key={bEdge.id}
+                                      type="button"
+                                      className={`route-switch-pill ${
+                                        isTaken ? "active" : ""
+                                      }`}
+                                      onClick={() =>
+                                        handleSwitchBranchAtStep(idx, bEdge)
+                                      }
+                                      title={
+                                        isTaken
+                                          ? "現在選択中の分岐です"
+                                          : "クリックすると最初からやり直さずにこの分岐へルートを切り替えます"
+                                      }
+                                    >
+                                      {isTaken ? "✓ " : "⇄ "}
+                                      分岐{bEdge.sourceSlot + 1}
+                                      {bEdge.label
+                                        ? `: ${bEdge.label}`
+                                        : bTarget
+                                          ? ` (${bTarget.title || "無題"})`
+                                          : ""}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+
                           {changes.length > 0 && (
                             <div className="route-timeline-changes">
                               {changes.map((c, cIdx) => (
@@ -3887,200 +4208,185 @@ export function App() {
                   </div>
                 )}
 
-                {/* 3C. フラグ・変数の変更設定（四角・ひし形共通） */}
-                <div className="form-group special-box effects-special-box">
-                  <div className="route-section-header">
-                    <label className="form-label">
-                      ⚡ フラグ・変数の変更（この図形での値の変化）
-                    </label>
-                    <button
-                      type="button"
-                      className="btn-link-inline"
-                      onClick={() => setShowVariableModal(true)}
-                    >
-                      ＋変数定義を管理
-                    </button>
-                  </div>
-
-                  {(chart.variables ?? []).length === 0 ? (
-                    <div className="connection-empty-note">
-                      まず「＋変数定義を管理」からフラグ・変数（string / number / boolean）を登録してください。
-                    </div>
-                  ) : (
-                    <>
-                      {(selectedNode.effects ?? []).length === 0 ? (
-                        <div className="connection-empty-note">
-                          この図形での変数変更は設定されていません。
-                        </div>
-                      ) : (
-                        <div className="node-effects-editor-list">
-                          {(selectedNode.effects ?? []).map((eff) => {
-                            const targetVar = variableMap.get(eff.variableId);
-                            const varType: VariableType = targetVar?.type ?? "string";
-                            const slotCount = getNodeSlotCount(selectedNode);
-
-                            return (
-                              <div key={eff.id} className="node-effect-editor-card">
-                                <div className="node-effect-editor-row">
-                                  {/* 複数分岐がある場合は「図形通過時」か「特定の分岐選択時」を選べる */}
-                                  {slotCount > 1 && (
-                                    <select
-                                      className="effect-timing-select"
-                                      value={
-                                        eff.branchSlot === null ||
-                                        eff.branchSlot === undefined
-                                          ? "node"
-                                          : String(eff.branchSlot)
-                                      }
-                                      onChange={(e) =>
-                                        handleUpdateNodeEffect(
-                                          selectedNode.id,
-                                          eff.id,
-                                          {
-                                            branchSlot:
-                                              e.target.value === "node"
-                                                ? null
-                                                : Number.parseInt(e.target.value, 10),
-                                          }
-                                        )
-                                      }
-                                      title="いつ変数を変更するか"
-                                    >
-                                      <option value="node">この図形を通過時</option>
-                                      {Array.from({ length: slotCount }, (_, sIdx) => (
-                                        <option key={sIdx} value={String(sIdx)}>
-                                          分岐 {sIdx + 1} を選択時
-                                        </option>
-                                      ))}
-                                    </select>
-                                  )}
-
-                                  {/* 変数選択 */}
-                                  <select
-                                    className="effect-var-select"
-                                    value={eff.variableId}
-                                    onChange={(e) =>
-                                      handleUpdateNodeEffect(selectedNode.id, eff.id, {
-                                        variableId: e.target.value,
-                                      })
-                                    }
-                                  >
-                                    {(chart.variables ?? []).map((v) => (
-                                      <option key={v.id} value={v.id}>
-                                        {v.name} ({v.type})
-                                      </option>
-                                    ))}
-                                  </select>
-
-                                  <button
-                                    type="button"
-                                    className="slot-unlink-btn"
-                                    onClick={() =>
-                                      handleDeleteNodeEffect(selectedNode.id, eff.id)
-                                    }
-                                    title="この変更設定を削除"
-                                  >
-                                    削除
-                                  </button>
-                                </div>
-
-                                <div className="node-effect-editor-row">
-                                  {/* 操作（=, +=, -=, 反転） */}
-                                  <select
-                                    className="effect-op-select"
-                                    value={eff.op}
-                                    onChange={(e) =>
-                                      handleUpdateNodeEffect(selectedNode.id, eff.id, {
-                                        op: e.target.value as VariableEffectOp,
-                                      })
-                                    }
-                                  >
-                                    <option value="set">= （代入する）</option>
-                                    {varType === "number" && (
-                                      <>
-                                        <option value="add">+= （加算する）</option>
-                                        <option value="subtract">-= （減算する）</option>
-                                      </>
-                                    )}
-                                    {varType === "boolean" && (
-                                      <option value="toggle">! （ON/OFF反転）</option>
-                                    )}
-                                  </select>
-
-                                  {/* 変更値の入力（型に応じる） */}
-                                  {eff.op !== "toggle" &&
-                                    (varType === "boolean" ? (
-                                      <select
-                                        className="effect-val-input"
-                                        value={String(Boolean(eff.value))}
-                                        onChange={(e) =>
-                                          handleUpdateNodeEffect(
-                                            selectedNode.id,
-                                            eff.id,
-                                            {
-                                              value: e.target.value === "true",
-                                            }
-                                          )
-                                        }
-                                      >
-                                        <option value="true">true (ON)</option>
-                                        <option value="false">false (OFF)</option>
-                                      </select>
-                                    ) : varType === "number" ? (
-                                      <input
-                                        type="number"
-                                        className="effect-val-input"
-                                        value={Number(eff.value) || 0}
-                                        onChange={(e) =>
-                                          handleUpdateNodeEffect(
-                                            selectedNode.id,
-                                            eff.id,
-                                            {
-                                              value: Number(e.target.value) || 0,
-                                            }
-                                          )
-                                        }
-                                      />
-                                    ) : (
-                                      <input
-                                        type="text"
-                                        className="effect-val-input"
-                                        value={String(eff.value ?? "")}
-                                        placeholder="変更後の文字列..."
-                                        onChange={(e) =>
-                                          handleUpdateNodeEffect(
-                                            selectedNode.id,
-                                            eff.id,
-                                            {
-                                              value: e.target.value,
-                                            }
-                                          )
-                                        }
-                                      />
-                                    ))}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-
+                {/* 3C. 四角（節）専用：この節自体を通過した時のフラグ・変数の変更設定 */}
+                {selectedNode.type === "rect" && (
+                  <div className="form-group special-box effects-special-box">
+                    <div className="route-section-header">
+                      <label className="form-label">
+                        ⚡ フラグ・変数の変更（この節での値の変化）
+                      </label>
                       <button
                         type="button"
-                        className="btn btn-secondary"
-                        style={{ width: "100%", marginTop: "4px" }}
-                        onClick={() => handleAddNodeEffect(selectedNode.id, null)}
+                        className="btn-link-inline"
+                        onClick={() => setShowVariableModal(true)}
                       >
-                        ＋ この図形で変数の変更を追加
+                        ＋変数定義を管理
                       </button>
-                    </>
-                  )}
-                </div>
+                    </div>
 
-                {/* 4. 下流への接続状況 ＆ 分岐線のコメント入力 */}
+                    {(chart.variables ?? []).length === 0 ? (
+                      <div className="connection-empty-note">
+                        まず「＋変数定義を管理」からフラグ・変数（string / number / boolean）を登録してください。
+                      </div>
+                    ) : (
+                      <>
+                        {(() => {
+                          const rectOwnEffects = (selectedNode.effects ?? []).filter(
+                            (eff) => eff.branchSlot === null || eff.branchSlot === undefined
+                          );
+                          return rectOwnEffects.length === 0 ? (
+                            <div className="connection-empty-note">
+                              この節での変数変更は設定されていません。
+                            </div>
+                          ) : (
+                            <div className="node-effects-editor-list">
+                              {rectOwnEffects.map((eff) => {
+                                const targetVar = variableMap.get(eff.variableId);
+                                const varType: VariableType = targetVar?.type ?? "string";
+
+                                return (
+                                  <div key={eff.id} className="node-effect-editor-card">
+                                    <div className="node-effect-editor-row">
+                                      <select
+                                        className="effect-var-select"
+                                        value={eff.variableId}
+                                        onChange={(e) =>
+                                          handleUpdateNodeEffect(selectedNode.id, eff.id, {
+                                            variableId: e.target.value,
+                                          })
+                                        }
+                                      >
+                                        {(chart.variables ?? []).map((v) => (
+                                          <option key={v.id} value={v.id}>
+                                            {v.name} ({v.type})
+                                          </option>
+                                        ))}
+                                      </select>
+
+                                      <button
+                                        type="button"
+                                        className="slot-unlink-btn"
+                                        onClick={() =>
+                                          handleDeleteNodeEffect(selectedNode.id, eff.id)
+                                        }
+                                        title="この変更設定を削除"
+                                      >
+                                        削除
+                                      </button>
+                                    </div>
+
+                                    <div className="node-effect-editor-row">
+                                      <select
+                                        className="effect-op-select"
+                                        value={eff.op}
+                                        onChange={(e) =>
+                                          handleUpdateNodeEffect(selectedNode.id, eff.id, {
+                                            op: e.target.value as VariableEffectOp,
+                                          })
+                                        }
+                                      >
+                                        <option value="set">= （代入する）</option>
+                                        {varType === "number" && (
+                                          <>
+                                            <option value="add">+= （加算する）</option>
+                                            <option value="subtract">-= （減算する）</option>
+                                          </>
+                                        )}
+                                        {varType === "boolean" && (
+                                          <option value="toggle">! （ON/OFF反転）</option>
+                                        )}
+                                      </select>
+
+                                      {eff.op !== "toggle" &&
+                                        (varType === "boolean" ? (
+                                          <select
+                                            className="effect-val-input"
+                                            value={String(Boolean(eff.value))}
+                                            onChange={(e) =>
+                                              handleUpdateNodeEffect(
+                                                selectedNode.id,
+                                                eff.id,
+                                                {
+                                                  value: e.target.value === "true",
+                                                }
+                                              )
+                                            }
+                                          >
+                                            <option value="true">true (ON)</option>
+                                            <option value="false">false (OFF)</option>
+                                          </select>
+                                        ) : varType === "number" ? (
+                                          <input
+                                            type="number"
+                                            className="effect-val-input"
+                                            value={Number(eff.value) || 0}
+                                            onChange={(e) =>
+                                              handleUpdateNodeEffect(
+                                                selectedNode.id,
+                                                eff.id,
+                                                {
+                                                  value: Number(e.target.value) || 0,
+                                                }
+                                              )
+                                            }
+                                          />
+                                        ) : (
+                                          <input
+                                            type="text"
+                                            className="effect-val-input"
+                                            value={String(eff.value ?? "")}
+                                            placeholder="変更後の文字列..."
+                                            onChange={(e) =>
+                                              handleUpdateNodeEffect(
+                                                selectedNode.id,
+                                                eff.id,
+                                                {
+                                                  value: e.target.value,
+                                                }
+                                              )
+                                            }
+                                          />
+                                        ))}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          );
+                        })()}
+
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ width: "100%", marginTop: "4px" }}
+                          onClick={() => handleAddNodeEffect(selectedNode.id, null)}
+                        >
+                          ＋ この節で変数の変更を追加
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {/* 4. 下流への接続状況 ＆ 分岐線のコメント入力 ＆ 選択肢ごとのフラグ・変数変更 */}
                 <div className="drawer-connections-section">
-                  <div className="form-label">
-                    下流への接続と線のコメント（条件メモ）
+                  <div className="route-section-header">
+                    <div className="form-label">
+                      下流への接続と線のコメント
+                      {(selectedNode.type === "diamond" ||
+                        getNodeSlotCount(selectedNode) > 1) &&
+                        "・フラグ/変数の変更"}
+                    </div>
+                    {(selectedNode.type === "diamond" ||
+                      getNodeSlotCount(selectedNode) > 1) && (
+                      <button
+                        type="button"
+                        className="btn-link-inline"
+                        onClick={() => setShowVariableModal(true)}
+                      >
+                        ＋変数定義を管理
+                      </button>
+                    )}
                   </div>
                   {selectedNode.type === "rect" && selectedNode.isEnd ? (
                     <div className="connection-empty-note">
@@ -4098,12 +4404,19 @@ export function App() {
                               nodeMap.has(e.targetId)
                           );
                           const target = edge ? nodeMap.get(edge.targetId) : null;
+                          const showSlotEffects =
+                            selectedNode.type === "diamond" ||
+                            getNodeSlotCount(selectedNode) > 1;
+                          const slotEffects = (selectedNode.effects ?? []).filter(
+                            (eff) => eff.branchSlot === slotIdx
+                          );
+
                           return (
                             <div key={slotIdx} className="slot-status-card">
                               <div className="slot-status-item">
                                 <span className="slot-index-label">
                                   {getNodeSlotCount(selectedNode) > 1
-                                    ? `分岐 ${slotIdx + 1}`
+                                    ? `選択肢 / 分岐 ${slotIdx + 1}`
                                     : "接続先"}
                                 </span>
                                 {target ? (
@@ -4141,6 +4454,170 @@ export function App() {
                                     }
                                     placeholder="線のコメント（例：SAN値が80以下の場合）"
                                   />
+                                </div>
+                              )}
+
+                              {/* 選択肢（分岐）ごとのフラグ・変数変更 */}
+                              {showSlotEffects && (
+                                <div className="slot-branch-effects-area">
+                                  <div className="slot-branch-effects-header">
+                                    <span>
+                                      ⚡ この選択肢（分岐 {slotIdx + 1}）でのフラグ・変数変更
+                                    </span>
+                                  </div>
+                                  {slotEffects.length > 0 && (
+                                    <div className="node-effects-editor-list">
+                                      {slotEffects.map((eff) => {
+                                        const targetVar = variableMap.get(eff.variableId);
+                                        const varType: VariableType =
+                                          targetVar?.type ?? "string";
+
+                                        return (
+                                          <div
+                                            key={eff.id}
+                                            className="node-effect-editor-card"
+                                          >
+                                            <div className="node-effect-editor-row">
+                                              <select
+                                                className="effect-var-select"
+                                                value={eff.variableId}
+                                                onChange={(e) =>
+                                                  handleUpdateNodeEffect(
+                                                    selectedNode.id,
+                                                    eff.id,
+                                                    {
+                                                      variableId: e.target.value,
+                                                    }
+                                                  )
+                                                }
+                                              >
+                                                {(chart.variables ?? []).map((v) => (
+                                                  <option key={v.id} value={v.id}>
+                                                    {v.name} ({v.type})
+                                                  </option>
+                                                ))}
+                                              </select>
+
+                                              <button
+                                                type="button"
+                                                className="slot-unlink-btn"
+                                                onClick={() =>
+                                                  handleDeleteNodeEffect(
+                                                    selectedNode.id,
+                                                    eff.id
+                                                  )
+                                                }
+                                                title="この変更設定を削除"
+                                              >
+                                                削除
+                                              </button>
+                                            </div>
+
+                                            <div className="node-effect-editor-row">
+                                              <select
+                                                className="effect-op-select"
+                                                value={eff.op}
+                                                onChange={(e) =>
+                                                  handleUpdateNodeEffect(
+                                                    selectedNode.id,
+                                                    eff.id,
+                                                    {
+                                                      op: e.target
+                                                        .value as VariableEffectOp,
+                                                    }
+                                                  )
+                                                }
+                                              >
+                                                <option value="set">= （代入する）</option>
+                                                {varType === "number" && (
+                                                  <>
+                                                    <option value="add">
+                                                      += （加算する）
+                                                    </option>
+                                                    <option value="subtract">
+                                                      -= （減算する）
+                                                    </option>
+                                                  </>
+                                                )}
+                                                {varType === "boolean" && (
+                                                  <option value="toggle">
+                                                    ! （ON/OFF反転）
+                                                  </option>
+                                                )}
+                                              </select>
+
+                                              {eff.op !== "toggle" &&
+                                                (varType === "boolean" ? (
+                                                  <select
+                                                    className="effect-val-input"
+                                                    value={String(Boolean(eff.value))}
+                                                    onChange={(e) =>
+                                                      handleUpdateNodeEffect(
+                                                        selectedNode.id,
+                                                        eff.id,
+                                                        {
+                                                          value:
+                                                            e.target.value === "true",
+                                                        }
+                                                      )
+                                                    }
+                                                  >
+                                                    <option value="true">
+                                                      true (ON)
+                                                    </option>
+                                                    <option value="false">
+                                                      false (OFF)
+                                                    </option>
+                                                  </select>
+                                                ) : varType === "number" ? (
+                                                  <input
+                                                    type="number"
+                                                    className="effect-val-input"
+                                                    value={Number(eff.value) || 0}
+                                                    onChange={(e) =>
+                                                      handleUpdateNodeEffect(
+                                                        selectedNode.id,
+                                                        eff.id,
+                                                        {
+                                                          value:
+                                                            Number(e.target.value) || 0,
+                                                        }
+                                                      )
+                                                    }
+                                                  />
+                                                ) : (
+                                                  <input
+                                                    type="text"
+                                                    className="effect-val-input"
+                                                    value={String(eff.value ?? "")}
+                                                    placeholder="変更後の文字列..."
+                                                    onChange={(e) =>
+                                                      handleUpdateNodeEffect(
+                                                        selectedNode.id,
+                                                        eff.id,
+                                                        {
+                                                          value: e.target.value,
+                                                        }
+                                                      )
+                                                    }
+                                                  />
+                                                ))}
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+
+                                  <button
+                                    type="button"
+                                    className="btn btn-small slot-add-effect-btn"
+                                    onClick={() =>
+                                      handleAddNodeEffect(selectedNode.id, slotIdx)
+                                    }
+                                  >
+                                    ＋ 分岐 {slotIdx + 1} にフラグ・変数の変更を追加
+                                  </button>
                                 </div>
                               )}
                             </div>
